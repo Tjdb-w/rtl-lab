@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rtl-lab"
+version = "0.1.0"
+description = "硬件仿真与 RTL 验证框架：编译 Verilog、运行仿真并生成验证报告"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "RTL Lab" }]
+keywords = ["verilog", "rtl", "simulation", "icarus", "verification"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+dependencies = []
+
+[project.scripts]
+rtl-lab = "rtl_lab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
