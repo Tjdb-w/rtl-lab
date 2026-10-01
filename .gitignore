@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+
+# RTL Lab work artifacts
+.rtl-lab-work/
+*.vvp
+*.tmp
