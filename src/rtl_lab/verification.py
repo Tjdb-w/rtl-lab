@@ -19,6 +19,13 @@
 
 测试台失败、断言失败或覆盖率低于阈值时仍生成完整报告，总体 ``result``
 记为 ``failed``；只有全部检查通过且没有跳过必测项才记为 ``passed``。
+
+基线对比（``VerifyConfig.baseline_path``，schema v4）：先按原流程生成
+当前结果，再把当前报告与上次 ``verify`` 生成的基线报告按 name 对齐对比
+（testbenches、assertions、coverage），在 v3 字段之后追加
+``comparison``；有差异时总体 ``result`` 记为 ``failed``。基线不存在、
+不可读、非合法 JSON、不是 rtl-lab 验证报告或版本不受支持时抛
+:class:`InputError`，不执行仿真、不生成或覆盖报告。
 """
 
 import hashlib
@@ -28,11 +35,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from .baseline import compare_verification_reports, load_baseline_report
 from .duration import normalize_duration
 from .errors import InputError
 from .parser import ResultCollector
 from .report import (
     Report,
+    VERIFICATION_COMPARISON_SCHEMA_VERSION,
     build_verification_report,
     ensure_report_writable,
     write_report,
@@ -154,6 +163,8 @@ class VerifyConfig:
     :param workdir: 工作目录（各测试台产物置于其下独立子目录）。
     :param report_path: JSON 报告输出路径，可为 None。
     :param jobs: 并发编译/仿真的测试台数，默认 1（顺序执行）。
+    :param baseline_path: 上次 verify 生成的 JSON 报告路径，可为 None；
+        指定时生成带 ``comparison`` 的 schema v4 报告。
     """
 
     sources: list
@@ -164,6 +175,7 @@ class VerifyConfig:
     workdir: str = "."
     report_path: str = None
     jobs: int = 1
+    baseline_path: str = None
 
     def __post_init__(self):
         self.sources = list(self.sources)
@@ -345,7 +357,8 @@ def verify(config=None, **kwargs):
         断言失败或覆盖率不达标时不抛异常，报告 ``result`` 为 ``failed``。
     :raises ValueError: ``run_id`` 为空或覆盖率/jobs 配置非法。
     :raises OSError: 报告输出位置不可写。
-    :raises InputError: 源文件/测试台/时长等输入非法。
+    :raises InputError: 源文件/测试台/时长等输入非法，或基线报告不存在、
+        不可读、非合法 JSON、非 rtl-lab 验证报告、版本不受支持。
     :raises RuntimeError: 结果归属错误、命名冲突、无可执行测试台或无任何
         覆盖率结果；这几种情况不覆盖已有报告。
     """
@@ -355,6 +368,11 @@ def verify(config=None, **kwargs):
         raise TypeError("verify() 不能同时传入 VerifyConfig 与关键字参数")
 
     amount, unit = _validate(config)
+
+    # 基线属于输入校验：非法基线抛 InputError，不执行仿真、不生成报告。
+    baseline = None
+    if config.baseline_path:
+        baseline = load_baseline_report(config.baseline_path)
     duration_str = f"{amount}{unit}"
     run_token = f"{config.run_id.strip()}"
     tb_dirs = _plan_tb_dirs(config.testbenches)
@@ -436,6 +454,19 @@ def verify(config=None, **kwargs):
         workdir=config.workdir,
         known_paths=known_paths,
     )
+
+    if baseline is not None:
+        # 基线对比：v3 字段及顺序保持不变，comparison 追加在最后；
+        # 有差异时总体结论记为 failed（无论当前检查是否通过）。
+        data["schema_version"] = VERIFICATION_COMPARISON_SCHEMA_VERSION
+        comparison = compare_verification_reports(
+            data, baseline,
+            baseline_path=config.baseline_path, workdir=config.workdir,
+        )
+        data["comparison"] = comparison
+        if not comparison["passed"]:
+            data["result"] = "failed"
+
     report = Report(data)
     if config.report_path:
         write_report(report, config.report_path)

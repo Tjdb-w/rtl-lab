@@ -13,19 +13,20 @@
     rtl-lab verify --run-id ID --duration 100ns \
         --tb FILE[@top[@name]] ... [--cover NAME ...] \
         [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
-        [--tb-seed NAME=SEED ...] [--jobs N] \
+        [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
         [--workdir DIR] [--report report.json] \
         design1.v [design2.v ...]
 
 退出码：
 
 - 0：仿真正常结束且断言全部通过（verify 为总体结论 passed）；
-- 2：输入校验失败（不生成报告）；
+- 2：输入校验失败（含基线报告不存在/不可读/非法；不生成报告）；
 - 3：编译失败（生成 compile_failed 报告）；
 - 4：模拟器无法启动（不生成报告）；
 - 5：仿真进程非零退出（生成 simulation_failed 报告）；
 - 6：断言失败（生成 assertion_failed 报告）；
-- 7：统一验证总体结论 failed（仍生成完整 verify 报告）；
+- 7：统一验证总体结论 failed 或基线对比存在差异（仍生成完整
+  verify 报告）；
 - 8：verify 前置条件失败（run_id 为空、输出位置不可写、结果归属/命名
   冲突、无可执行测试台或无任何覆盖率结果；不生成或覆盖报告）。
 """
@@ -154,6 +155,11 @@ def _add_verify_args(p):
         help="并发执行测试台的数量（默认 1，结果始终按选择顺序收集）",
     )
     p.add_argument(
+        "--baseline", dest="baseline", default=None, metavar="PATH",
+        help="上次 verify 生成的 JSON 报告路径；指定时与当前结果对比，"
+             "生成带 comparison 的 schema v4 报告，存在差异则结论 failed",
+    )
+    p.add_argument(
         "--report", dest="report", default=None, metavar="PATH",
         help="JSON 报告输出路径",
     )
@@ -215,6 +221,7 @@ def _build_verify_config(args):
         workdir=args.workdir,
         report_path=args.report,
         jobs=args.jobs,
+        baseline_path=args.baseline,
     )
 
 
@@ -254,21 +261,24 @@ def _print_regress_summary(report):
 
 
 def _print_verify_summary(report):
-    """统一验证的结尾汇总行（写 stderr）。"""
+    """统一验证的结尾汇总行（写 stderr）；带基线对比时末尾附差异条数。"""
     tbs = report["testbench_summary"]
     cov = report["coverage_summary"]
     ass = report["assertion_summary"]
     ratio = cov["ratio"]
     ratio_text = "-" if ratio is None else f"{ratio:.0%}"
-    print(
+    message = (
         f"rtl-lab: {report['result']}："
         f"运行 {report['run_id']}；"
         f"测试台 通过 {tbs['passed']}/失败 {tbs['failed']}/跳过 {tbs['skipped']}；"
         f"断言 {ass['total']}（失败 {ass['failed']}）；"
         f"覆盖率 {cov['hit_points']}/{cov['total_points']} "
-        f"({ratio_text}，阈值 {cov['threshold']:g})",
-        file=sys.stderr,
+        f"({ratio_text}，阈值 {cov['threshold']:g})"
     )
+    comparison = report.get("comparison")
+    if comparison is not None:
+        message += f"；基线差异 {len(comparison['mismatches'])} 条"
+    print(message, file=sys.stderr)
 
 
 def main(argv=None):

@@ -13,6 +13,10 @@
 ``assertion_summary``、``coverage_summary``、``skipped_required``、
 ``generated_at``；旧字段语义与脱敏规则保持不变，旧读取逻辑凭
 ``schema_version`` 与 ``format`` 即可识别为新格式，不会误判为 v1/v2。
+
+带基线对比的统一验证报告（``verify --baseline``，schema v4）在 v3
+字段及顺序之后追加 ``comparison``（基线路径、无差异标记与结构化差异）；
+对比逻辑见 :mod:`rtl_lab.baseline`。
 """
 
 import json
@@ -27,6 +31,10 @@ REGRESS_SCHEMA_VERSION = 2
 
 #: 统一验证报告结构版本。
 VERIFICATION_SCHEMA_VERSION = 3
+
+#: 带基线对比的统一验证报告结构版本（v3 字段及顺序之后追加
+#: ``comparison``；仅 ``verify --baseline`` 产出）。
+VERIFICATION_COMPARISON_SCHEMA_VERSION = 4
 
 #: 统一验证报告的格式标识（旧读取逻辑据此与 v1/v2 区分）。
 VERIFICATION_FORMAT = "rtl-lab-verification"
