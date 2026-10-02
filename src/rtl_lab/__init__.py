@@ -9,7 +9,9 @@
   :class:`VerifyConfig`、:class:`TestSpec`、:class:`CoverageConfig`；
 - 异常类型 :class:`RTLLabError` 及其子类；
 - :data:`SCHEMA_VERSION`：单次 JSON 报告结构版本；
-- :data:`VERIFICATION_SCHEMA_VERSION`：统一验证报告结构版本。
+- :data:`VERIFICATION_SCHEMA_VERSION`：统一验证报告结构版本；
+- :data:`VERIFICATION_BASELINE_SCHEMA_VERSION`：带基线对比的统一验证
+  报告结构版本（schema v4）。
 """
 
 from .errors import (
@@ -19,7 +21,11 @@ from .errors import (
     ToolError,
     SimulationError,
 )
-from .report import SCHEMA_VERSION, VERIFICATION_SCHEMA_VERSION
+from .report import (
+    SCHEMA_VERSION,
+    VERIFICATION_SCHEMA_VERSION,
+    VERIFICATION_BASELINE_SCHEMA_VERSION,
+)
 from .runner import RegressConfig, RunConfig, regress, run
 from .verification import CoverageConfig, TestSpec, VerifyConfig, verify
 
@@ -39,4 +45,5 @@ __all__ = [
     "SimulationError",
     "SCHEMA_VERSION",
     "VERIFICATION_SCHEMA_VERSION",
+    "VERIFICATION_BASELINE_SCHEMA_VERSION",
 ]

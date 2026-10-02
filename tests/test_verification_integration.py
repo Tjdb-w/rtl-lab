@@ -85,6 +85,31 @@ module tb_noassert;
 endmodule
 """
 
+# 同名测试台：a1 失败 1 次 / 失败 2 次，其余完全一致（用于制造纯
+# fail_count 差异）。
+TB_A_FAIL1 = """
+`timescale 1ns/1ps
+module tb_a;
+  initial begin
+    $display("ASSERT FAIL a1 boom");
+    $display("COVER c1");
+    #5 $finish;
+  end
+endmodule
+"""
+
+TB_A_FAIL2 = """
+`timescale 1ns/1ps
+module tb_a;
+  initial begin
+    $display("ASSERT FAIL a1 boom");
+    $display("ASSERT FAIL a1 boom");
+    $display("COVER c1");
+    #5 $finish;
+  end
+endmodule
+"""
+
 
 @pytest.fixture
 def project(tmp_path):
@@ -423,3 +448,275 @@ def test_missing_source_input_error(project):
     )
     with pytest.raises(InputError):
         verify(cfg)
+
+
+# ---------------- 基线对比（schema v4） ----------------
+
+def _cfg_with_baseline(project, tb_names, baseline_path, **kw):
+    cfg = _cfg(project, tb_names, **kw)
+    cfg.baseline_path = baseline_path
+    return cfg
+
+
+def _mismatches_by(report):
+    return {(m["kind"], m["name"]): m
+            for m in report["comparison"]["mismatches"]}
+
+
+def test_baseline_identical_run_is_v4_passed_exit_shape(project):
+    cfg1 = _cfg(project, ["pass", "pass2"], run_id="R", report=True)
+    first = verify(cfg1)
+    assert first["schema_version"] == 3
+    assert "comparison" not in first
+
+    cfg2 = _cfg_with_baseline(
+        project, ["pass", "pass2"], cfg1.report_path, run_id="R2"
+    )
+    second = verify(cfg2)
+    assert second["schema_version"] == 4
+    assert second["format"] == "rtl-lab-verification"
+    assert second["result"] == "passed"
+    # comparison 位于 v3 全部字段之后。
+    assert list(second.keys())[-1] == "comparison"
+    cmp_ = second["comparison"]
+    assert set(cmp_) == {"baseline", "passed", "mismatches"}
+    assert cmp_["passed"] is True
+    assert cmp_["mismatches"] == []
+    assert cmp_["baseline"] == "report.json"
+    # v3 字段语义与顺序不变。
+    assert second["testbench_summary"] == first["testbench_summary"]
+    # 落盘报告同样为 v4。
+    assert _load(cfg2.report_path)["schema_version"] == 4
+
+
+def test_baseline_new_testbench_and_assertion_and_coverage_added(project):
+    base_cfg = _cfg(project, ["pass"], run_id="R")
+    verify(base_cfg)
+    cfg = _cfg_with_baseline(
+        project, ["pass", "pass2"], base_cfg.report_path, run_id="R2"
+    )
+    report = verify(cfg)
+    # 当前运行本身通过，但相对基线新增测试台 tb_pass2（及 a2/c2）=> failed。
+    assert report["result"] == "failed"
+    by = _mismatches_by(report)
+    assert ("testbench.added", "tb_pass2") in by
+    assert ("assertion.added", "a2") in by
+    assert ("coverage.added", "c2") in by
+    add_tb = by[("testbench.added", "tb_pass2")]
+    assert add_tb["expected"] is None
+    assert add_tb["actual"]["name"] == "tb_pass2"
+    assert add_tb["actual"]["status"] == "passed"
+    assert by[("assertion.added", "a2")]["actual"] == {
+        "name": "a2", "status": "passed", "fail_count": 0
+    }
+    assert by[("coverage.added", "c2")]["actual"] == {
+        "name": "c2", "status": "hit", "hits": 1, "hit_testbenches": 1
+    }
+
+
+def test_baseline_missing_testbench_recorded(project):
+    base_cfg = _cfg(project, ["pass", "pass2"], run_id="R")
+    verify(base_cfg)
+    cfg = _cfg_with_baseline(
+        project, ["pass"], base_cfg.report_path, run_id="R2"
+    )
+    report = verify(cfg)
+    assert report["result"] == "failed"
+    by = _mismatches_by(report)
+    miss = by[("testbench.missing", "tb_pass2")]
+    assert miss["actual"] is None
+    assert miss["expected"]["name"] == "tb_pass2"
+    assert miss["expected"]["status"] == "passed"
+    assert ("assertion.missing", "a2") in by
+    assert ("coverage.missing", "c2") in by
+
+
+def test_baseline_status_change_fails_with_scalar_diffs(project):
+    # 基线全通过；当前把 pass2 换成断言失败台（a2 变 failed）。
+    base_cfg = _cfg(project, ["pass", "pass2"], run_id="R")
+    verify(base_cfg)
+    _, src, tbs = project
+    cfg = VerifyConfig(
+        sources=[src],
+        testbenches=[
+            TestSpec(testbench=tbs["pass"]),
+            TestSpec(testbench=tbs["afail"]),
+        ],
+        run_id="R2", duration="100ns", coverage=CoverageConfig(),
+        workdir=str(project[0] / "work"),
+        report_path=str(project[0] / "report.json"),
+        baseline_path=base_cfg.report_path,
+    )
+    report = verify(cfg)
+    assert report["result"] == "failed"
+    by = _mismatches_by(report)
+    # 测试台 tb_afail 新增、tb_pass2 缺失（名字不同，按 name 对齐）。
+    assert ("testbench.added", "tb_afail") in by
+    assert ("testbench.missing", "tb_pass2") in by
+    # 断言 ax 新增；a2 缺失。
+    assert ("assertion.added", "ax") in by
+    assert ("assertion.missing", "a2") in by
+    # 覆盖率 c3 新增、c2 缺失。
+    assert ("coverage.added", "c3") in by
+    assert ("coverage.missing", "c2") in by
+    # 共有项 a1/c1 无差异。
+    assert not any(name == "a1" for (_k, name) in by)
+    assert not any(name == "c1" for (_k, name) in by)
+
+
+def test_baseline_fail_count_only_diff(project):
+    tmp_path, src, _tbs = project
+    p1 = tmp_path / "tb_a1.v"
+    p1.write_text(TB_A_FAIL1)
+    p2 = tmp_path / "tb_a2.v"
+    p2.write_text(TB_A_FAIL2)
+
+    cfg1 = VerifyConfig(
+        sources=[src],
+        testbenches=[TestSpec(testbench=str(p1), top="tb_a", name="tb_a")],
+        run_id="R", duration="100ns", coverage=CoverageConfig(),
+        workdir=str(tmp_path / "w1"),
+        report_path=str(tmp_path / "base.json"),
+    )
+    r1 = verify(cfg1)
+    assert r1["result"] == "failed"
+
+    cfg2 = VerifyConfig(
+        sources=[src],
+        testbenches=[TestSpec(testbench=str(p2), top="tb_a", name="tb_a")],
+        run_id="R2", duration="100ns", coverage=CoverageConfig(),
+        workdir=str(tmp_path / "w2"),
+        report_path=str(tmp_path / "cur.json"),
+        baseline_path=str(tmp_path / "base.json"),
+    )
+    r2 = verify(cfg2)
+    # 测试台 status/reason 两次都是 failed/assertion_failed；仅 a1 的
+    # fail_count 1 -> 2。
+    by = _mismatches_by(r2)
+    assert list(by) == [("assertion.fail_count", "a1")]
+    diff = by[("assertion.fail_count", "a1")]
+    assert diff["expected"] == 1 and diff["actual"] == 2
+    assert r2["comparison"]["passed"] is False
+
+
+def test_baseline_current_failure_still_generates_full_comparison(project):
+    # 基线全通过；当前运行包含编译失败台，仍须出完整报告与 comparison，
+    # 且不影响其余测试台执行。
+    base_cfg = _cfg(project, ["pass"], run_id="R")
+    verify(base_cfg)
+    cfg = _cfg_with_baseline(
+        project, ["pass", "cfail"], base_cfg.report_path, run_id="R2"
+    )
+    report = verify(cfg)
+    assert report["result"] == "failed"
+    tbs = {t["name"]: t for t in report["testbenches"]}
+    assert tbs["tb_pass"]["status"] == "passed"
+    assert tbs["tb_cfail"]["reason"] == "compilation_failed"
+    by = _mismatches_by(report)
+    added = by[("testbench.added", "tb_cfail")]
+    assert added["actual"]["reason"] == "compilation_failed"
+    assert added["actual"]["command"]["simulate"] == []
+
+
+def test_baseline_path_is_sanitized_in_comparison(project):
+    tmp_path, _src, _tbs = project
+    base_out = tmp_path / "secret_dir" / "base.json"
+    base_out.parent.mkdir()
+    base_cfg = _cfg(project, ["pass"], run_id="R")
+    base_cfg.report_path = str(base_out)
+    verify(base_cfg)
+
+    workdir = str(tmp_path / "w")
+    cfg = _cfg(project, ["pass"], run_id="R2")
+    cfg.workdir = workdir
+    cfg.baseline_path = str(base_out)
+    report = verify(cfg)
+    # 基线位于工作目录之外 => 仅保留 basename，不泄露绝对目录。
+    assert report["comparison"]["baseline"] == "base.json"
+    blob = json.dumps(report, ensure_ascii=False)
+    assert "secret_dir" not in blob
+
+
+def test_baseline_missing_file_input_error_no_report_written(project):
+    tmp_path, src, tbs = project
+    marker = tmp_path / "report.json"
+    cfg = VerifyConfig(
+        sources=[src],
+        testbenches=[TestSpec(testbench=tbs["pass"])],
+        run_id="rid", duration="100ns", coverage=CoverageConfig(),
+        workdir=str(tmp_path / "w"), report_path=str(marker),
+        baseline_path=str(tmp_path / "no-such-baseline.json"),
+    )
+    with pytest.raises(InputError):
+        verify(cfg)
+    assert not marker.exists()
+
+
+def test_baseline_malformed_json_input_error_preserves_report(project):
+    tmp_path, src, tbs = project
+    bad = tmp_path / "bad.json"
+    bad.write_text("{broken", encoding="utf-8")
+    marker = tmp_path / "report.json"
+    marker.write_text('{"keep": true}', encoding="utf-8")
+    cfg = VerifyConfig(
+        sources=[src],
+        testbenches=[TestSpec(testbench=tbs["pass"])],
+        run_id="rid", duration="100ns", coverage=CoverageConfig(),
+        workdir=str(tmp_path / "w"), report_path=str(marker),
+        baseline_path=str(bad),
+    )
+    with pytest.raises(InputError):
+        verify(cfg)
+    assert _load(marker) == {"keep": True}
+
+
+def test_baseline_wrong_format_input_error(project):
+    tmp_path, src, tbs = project
+    v1 = tmp_path / "v1.json"
+    v1.write_text(json.dumps({"schema_version": 1, "status": "passed"}),
+                  encoding="utf-8")
+    cfg = VerifyConfig(
+        sources=[src],
+        testbenches=[TestSpec(testbench=tbs["pass"])],
+        run_id="rid", duration="100ns", coverage=CoverageConfig(),
+        workdir=str(tmp_path / "w"),
+        report_path=str(tmp_path / "report.json"),
+        baseline_path=str(v1),
+    )
+    with pytest.raises(InputError):
+        verify(cfg)
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_baseline_unsupported_version_input_error(project):
+    tmp_path, src, tbs = project
+    future = tmp_path / "future.json"
+    future.write_text(json.dumps({
+        "schema_version": 99, "format": "rtl-lab-verification"
+    }), encoding="utf-8")
+    cfg = VerifyConfig(
+        sources=[src],
+        testbenches=[TestSpec(testbench=tbs["pass"])],
+        run_id="rid", duration="100ns", coverage=CoverageConfig(),
+        workdir=str(tmp_path / "w"),
+        report_path=str(tmp_path / "report.json"),
+        baseline_path=str(future),
+    )
+    with pytest.raises(InputError):
+        verify(cfg)
+
+
+def test_baseline_does_not_change_artifacts_selection_order(project):
+    # 有/无基线，测试台产物子目录与结果顺序必须一致。
+    plain = _cfg(project, ["pass2", "pass", "afail"], run_id="R")
+    r_plain = verify(plain)
+    based = _cfg_with_baseline(
+        project, ["pass2", "pass", "afail"], plain.report_path, run_id="R2"
+    )
+    r_base = verify(based)
+    assert [t["name"] for t in r_base["testbenches"]] == \
+        [t["name"] for t in r_plain["testbenches"]]
+    for a, b in zip(r_base["testbenches"], r_plain["testbenches"]):
+        assert a["name"] == b["name"]
+        assert a["command"] == b["command"]
+        assert a["status"] == b["status"]

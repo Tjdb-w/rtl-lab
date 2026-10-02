@@ -1,4 +1,4 @@
-"""统一验证执行：多测试台编译/仿真编排与可复现报告（schema v3）。
+"""统一验证执行：多测试台编译/仿真编排与可复现报告（schema v3/v4）。
 
 在 ``run`` / ``regress`` 之上提供新的公开入口 :func:`verify`：
 
@@ -6,7 +6,11 @@
   位置与运行标识 ``run_id``；
 - 每个测试台独立编译、独立仿真（各自产物置于工作目录下的独立子目录），
   可选择并发执行，但结果一律按测试选择顺序收集；
-- 产出 schema v3 统一验证报告，字段与顺序稳定，可复现、可追溯。
+- 产出 schema v3 统一验证报告，字段与顺序稳定，可复现、可追溯；
+- 指定 ``baseline_path``（``verify --baseline``）时，先生成当前结果，再
+  与基线报告按测试台、断言、覆盖率的 name 对齐对比，报告升级为 schema v4
+  并在 v3 字段之后追加 ``comparison``；存在任一差异时总体 result 强制为
+  failed（命令行退出码 7）。
 
 校验规则（生成报告之前）：
 
@@ -15,10 +19,14 @@
 - 结果不属于本次运行、测试台命名冲突、同一测试台重复记录抛
   :class:`RuntimeError`；
 - 没有可执行测试台或没有任何覆盖率结果抛 :class:`RuntimeError`，
-  且保留已有报告不被覆盖。
+  且保留已有报告不被覆盖；
+- 基线不存在、不可读、非合法 JSON、不是 rtl-lab 验证报告或版本不受支持
+  抛 :class:`InputError`（命令行退出码 2），不生成或覆盖报告。
 
 测试台失败、断言失败或覆盖率低于阈值时仍生成完整报告，总体 ``result``
 记为 ``failed``；只有全部检查通过且没有跳过必测项才记为 ``passed``。
+带基线时即使个别测试台失败/异常，也照常完成其余测试台并生成完整报告与
+comparison。
 """
 
 import hashlib
@@ -33,8 +41,11 @@ from .errors import InputError
 from .parser import ResultCollector
 from .report import (
     Report,
+    attach_verification_comparison,
+    build_verification_comparison,
     build_verification_report,
     ensure_report_writable,
+    load_verification_baseline,
     write_report,
 )
 from .runner import SOURCE_SUFFIXES, _prepare_and_compile  # noqa: PLC2701
@@ -153,6 +164,8 @@ class VerifyConfig:
     :param coverage: :class:`CoverageConfig`，缺省阈值 1.0。
     :param workdir: 工作目录（各测试台产物置于其下独立子目录）。
     :param report_path: JSON 报告输出路径，可为 None。
+    :param baseline_path: 基线 verify JSON 报告路径，可为 None；指定时
+        先生成当前结果再与基线对比，报告使用 schema v4。
     :param jobs: 并发编译/仿真的测试台数，默认 1（顺序执行）。
     """
 
@@ -163,6 +176,7 @@ class VerifyConfig:
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
     workdir: str = "."
     report_path: str = None
+    baseline_path: str = None
     jobs: int = 1
 
     def __post_init__(self):
@@ -227,7 +241,13 @@ def _validate(config):
     if config.report_path:
         ensure_report_writable(config.report_path)
 
-    return amount, unit
+    # 基线作为输入前置校验：非法基线（InputError）必须在任何执行与报告
+    # 写入之前失败；现有前置条件（上面的各项）仍按原异常类型返回 8。
+    baseline = None
+    if config.baseline_path:
+        baseline = load_verification_baseline(config.baseline_path)
+
+    return amount, unit, baseline
 
 
 class _TbConfig:
@@ -337,15 +357,20 @@ def _execute_testbench(spec, config, amount, unit, run_token, tb_dir):
 
 
 def verify(config=None, **kwargs):
-    """执行统一验证并生成 schema v3 报告。
+    """执行统一验证并生成 schema v3 报告（带基线时为 schema v4）。
 
     可传 :class:`VerifyConfig`，也可用关键字参数直接构造。
+
+    指定 ``baseline_path`` 时，先生成当前结果（执行顺序、种子、产物目录
+    与字段语义均与无基线时完全一致），再按测试台、断言、覆盖率的 name
+    与基线对比并追加 ``comparison``；任一差异都会使总体 result 为 failed。
 
     :returns: 始终返回 :class:`Report`（含总体 ``result``）；测试台失败、
         断言失败或覆盖率不达标时不抛异常，报告 ``result`` 为 ``failed``。
     :raises ValueError: ``run_id`` 为空或覆盖率/jobs 配置非法。
     :raises OSError: 报告输出位置不可写。
-    :raises InputError: 源文件/测试台/时长等输入非法。
+    :raises InputError: 源文件/测试台/时长等输入非法，或基线不存在、
+        不可读、非合法 JSON、不是 rtl-lab 验证报告或版本不受支持。
     :raises RuntimeError: 结果归属错误、命名冲突、无可执行测试台或无任何
         覆盖率结果；这几种情况不覆盖已有报告。
     """
@@ -354,7 +379,7 @@ def verify(config=None, **kwargs):
     elif kwargs:
         raise TypeError("verify() 不能同时传入 VerifyConfig 与关键字参数")
 
-    amount, unit = _validate(config)
+    amount, unit, baseline = _validate(config)
     duration_str = f"{amount}{unit}"
     run_token = f"{config.run_id.strip()}"
     tb_dirs = _plan_tb_dirs(config.testbenches)
@@ -436,6 +461,18 @@ def verify(config=None, **kwargs):
         workdir=config.workdir,
         known_paths=known_paths,
     )
+
+    # 基线对比在当前报告完整生成后进行：仅读取已脱敏的报告内容，不回改
+    # 任何测试台结果；差异仅体现为追加的 comparison 与总体 result。
+    if baseline is not None:
+        comparison = build_verification_comparison(
+            baseline_path=config.baseline_path,
+            baseline=baseline,
+            current=data,
+            workdir=config.workdir,
+        )
+        attach_verification_comparison(data, comparison)
+
     report = Report(data)
     if config.report_path:
         write_report(report, config.report_path)

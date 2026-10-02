@@ -13,11 +13,18 @@
 ``assertion_summary``、``coverage_summary``、``skipped_required``、
 ``generated_at``；旧字段语义与脱敏规则保持不变，旧读取逻辑凭
 ``schema_version`` 与 ``format`` 即可识别为新格式，不会误判为 v1/v2。
+
+带基线对比的统一验证报告（``verify --baseline``，schema v4）在 schema v3
+全部字段与顺序之后追加 ``comparison``：含脱敏后的基线路径 ``baseline``、
+无差异标记 ``passed`` 与结构化差异 ``mismatches``；存在任一差异时总体
+``result`` 强制为 ``failed``。
 """
 
 import json
 import os
 import re
+
+from .errors import InputError
 
 #: 单次报告结构版本。
 SCHEMA_VERSION = 1
@@ -28,8 +35,17 @@ REGRESS_SCHEMA_VERSION = 2
 #: 统一验证报告结构版本。
 VERIFICATION_SCHEMA_VERSION = 3
 
+#: 带基线对比的统一验证报告结构版本（v3 字段后追加 comparison）。
+VERIFICATION_BASELINE_SCHEMA_VERSION = 4
+
 #: 统一验证报告的格式标识（旧读取逻辑据此与 v1/v2 区分）。
 VERIFICATION_FORMAT = "rtl-lab-verification"
+
+#: 允许作为对比基线的报告结构版本（v3 与带对比的 v4 均可）。
+SUPPORTED_BASELINE_SCHEMA_VERSIONS = frozenset({
+    VERIFICATION_SCHEMA_VERSION,
+    VERIFICATION_BASELINE_SCHEMA_VERSION,
+})
 
 #: 统一验证报告使用的工具标识（与 v1/v2 字面值保持一致）。
 TOOL_NAME_VERIFICATION = "icarus-verilog"
@@ -508,3 +524,168 @@ def build_verification_report(*, run_id, sources, testbench_files,
         "skipped_required": skipped_required,
     }
     return data, result
+
+
+#: 对比所用的测试台完整记录字段及顺序（报告 testbenches 条目的子集）。
+_COMPARISON_TB_FIELDS = (
+    "name", "top", "testbench", "status", "reason", "required",
+    "start_time", "end_time", "command", "diagnostics", "assertions",
+    "coverage",
+)
+#: 测试台同名时逐一比较的标量字段。
+_COMPARISON_TB_DIFF_FIELDS = ("status", "reason")
+
+#: 对比所用的断言完整记录字段及顺序。
+_COMPARISON_ASSERTION_FIELDS = ("name", "status", "fail_count")
+#: 断言同名时逐一比较的字段（终态 status 或 fail_count）。
+_COMPARISON_ASSERTION_DIFF_FIELDS = ("status", "fail_count")
+
+#: 对比所用的覆盖率点完整记录字段及顺序。
+_COMPARISON_COVERAGE_FIELDS = ("name", "status", "hits", "hit_testbenches")
+#: 覆盖率点同名时逐一比较的字段。
+_COMPARISON_COVERAGE_DIFF_FIELDS = ("status", "hits", "hit_testbenches")
+
+
+def _project(record, fields):
+    """从记录中按固定字段顺序投影出“完整记录”（缺字段补 None）。"""
+    return {key: record.get(key) for key in fields}
+
+
+def load_verification_baseline(path):
+    """读取并校验作为对比基线的 verify JSON 报告。
+
+    :raises InputError: 路径不存在、不可读、非合法 JSON、顶层不是对象、
+        不是 rtl-lab 验证报告（``format`` 不符）或结构版本不受支持。
+    :returns: 解析后的基线报告 dict。
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise InputError("基线路径不能为空")
+    if not os.path.exists(path):
+        raise InputError(f"基线报告不存在：{path}")
+    if not os.path.isfile(path):
+        raise InputError(f"基线报告不是普通文件：{path}")
+    if not os.access(path, os.R_OK):
+        raise InputError(f"基线报告不可读：{path}")
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise InputError(f"基线报告不是合法 JSON：{path}（{exc}）") from exc
+    except OSError as exc:
+        raise InputError(f"基线报告不可读：{path}（{exc}）") from exc
+
+    if not isinstance(data, dict):
+        raise InputError(f"基线报告结构非法：{path}（顶层不是 JSON 对象）")
+    if data.get("format") != VERIFICATION_FORMAT:
+        raise InputError(f"基线报告不是 rtl-lab 验证报告：{path}")
+    if data.get("schema_version") not in SUPPORTED_BASELINE_SCHEMA_VERSIONS:
+        raise InputError(
+            f"基线报告版本不受支持：{path}（schema_version="
+            f"{data.get('schema_version')!r}）"
+        )
+    return data
+
+
+def _scalar_diffs(category, name, old_record, new_record, fields):
+    """对同名记录的逐标量字段差异；状态类字段优先于计数字段。"""
+    mismatches = []
+    for field_name in fields:
+        old_value = old_record.get(field_name)
+        new_value = new_record.get(field_name)
+        if old_value != new_value:
+            mismatches.append({
+                "kind": f"{category}.{field_name}",
+                "name": name,
+                "expected": old_value,
+                "actual": new_value,
+            })
+    return mismatches
+
+
+def _compare_named(category, baseline_entries, current_entries,
+                   full_fields, diff_fields):
+    """按 name 对齐一类记录，产出缺失/新增/字段差异。
+
+    差异内字段固定为 kind/name/expected/actual：缺失时 expected 为基线
+    完整记录、actual 为 None；新增时 expected 为 None、actual 为当前完整
+    记录；字段差异时 expected/actual 为对应标量。``full_fields`` 定义
+    缺失/新增时完整记录的投影，``diff_fields`` 定义同名时逐一比较的标量
+    字段。类别内按 name 的 Unicode 码点排序，同名字段差异各自保留。
+    """
+    mismatches = []
+    base_by = {e.get("name"): e for e in baseline_entries}
+    cur_by = {e.get("name"): e for e in current_entries}
+    for name in sorted(set(base_by) | set(cur_by)):
+        old = base_by.get(name)
+        new = cur_by.get(name)
+        if new is None:
+            mismatches.append({
+                "kind": f"{category}.missing",
+                "name": name,
+                "expected": _project(old, full_fields),
+                "actual": None,
+            })
+        elif old is None:
+            mismatches.append({
+                "kind": f"{category}.added",
+                "name": name,
+                "expected": None,
+                "actual": _project(new, full_fields),
+            })
+        else:
+            mismatches.extend(
+                _scalar_diffs(category, name, old, new, diff_fields)
+            )
+    return mismatches
+
+
+def build_verification_comparison(*, baseline_path, baseline, current,
+                                  workdir):
+    """对比两份 verify 报告的测试台、断言与覆盖率，返回 comparison dict。
+
+    三类记录均按 ``name`` 对齐，类别顺序固定为 testbench、assertion、
+    coverage，类别内按 name 的 Unicode 码点排序；同名不同字段的差异各自
+    保留为独立条目，不做合并。仅比较报告中的脱敏后内容，因此基线可来自
+    不同工作目录；``baseline`` 路径本身按当前工作目录脱敏后记录。
+    """
+    mismatches = []
+    mismatches.extend(_compare_named(
+        "testbench",
+        baseline.get("testbenches", []),
+        current.get("testbenches", []),
+        _COMPARISON_TB_FIELDS,
+        _COMPARISON_TB_DIFF_FIELDS,
+    ))
+    mismatches.extend(_compare_named(
+        "assertion",
+        baseline.get("assertions", []),
+        current.get("assertions", []),
+        _COMPARISON_ASSERTION_FIELDS,
+        _COMPARISON_ASSERTION_DIFF_FIELDS,
+    ))
+    mismatches.extend(_compare_named(
+        "coverage",
+        baseline.get("coverage", []),
+        current.get("coverage", []),
+        _COMPARISON_COVERAGE_FIELDS,
+        _COMPARISON_COVERAGE_DIFF_FIELDS,
+    ))
+    return {
+        "baseline": sanitize_path(baseline_path, workdir),
+        "passed": not mismatches,
+        "mismatches": mismatches,
+    }
+
+
+def attach_verification_comparison(data, comparison):
+    """把 comparison 追加到报告并盖 schema v4 版本戳（原地修改）。
+
+    在 schema v3 全部字段之后追加 ``comparison``；存在任一差异时把总体
+    ``result`` 强制为 ``failed``。返回同一报告 dict。
+    """
+    data["schema_version"] = VERIFICATION_BASELINE_SCHEMA_VERSION
+    data["comparison"] = comparison
+    if not comparison["passed"]:
+        data["result"] = "failed"
+    return data
