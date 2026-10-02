@@ -56,22 +56,22 @@ class RunConfig:
         self.report_path = report_path
 
 
-def _validate(config):
-    """校验全部输入，非法时抛 :class:`InputError`。"""
-    # 顶层模块名。
-    if not isinstance(config.top, str) or not config.top.strip():
+def _check_top(top):
+    """校验顶层模块名。"""
+    if not isinstance(top, str) or not top.strip():
         raise InputError("顶层模块名不能为空")
 
-    # 随机种子：整数且非负。
-    if isinstance(config.seed, bool) or not isinstance(config.seed, int):
-        raise InputError(f"随机种子必须为非负整数，收到 {config.seed!r}")
-    if config.seed < 0:
-        raise InputError(f"随机种子不能为负数，收到 {config.seed}")
 
-    # 时长（正整数 + 受支持单位）。
-    amount, unit, _fs = normalize_duration(config.duration)
+def _check_seed(seed):
+    """校验随机种子：整数且非负。"""
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise InputError(f"随机种子必须为非负整数，收到 {seed!r}")
+    if seed < 0:
+        raise InputError(f"随机种子不能为负数，收到 {seed}")
 
-    # 源文件与测试台：后缀合法且文件存在。
+
+def _check_sources(sources, testbench):
+    """校验源文件与测试台：后缀合法且文件存在。"""
     def check_file(path, label):
         if not isinstance(path, str) or not path.strip():
             raise InputError(f"{label}路径不能为空")
@@ -82,11 +82,22 @@ def _validate(config):
         if not os.path.isfile(path):
             raise InputError(f"{label}不存在：{path}")
 
-    if not config.sources:
+    if not sources:
         raise InputError("至少需要一个设计源文件")
-    for source in config.sources:
+    for source in sources:
         check_file(source, "设计源文件")
-    check_file(config.testbench, "测试台文件")
+    check_file(testbench, "测试台文件")
+
+
+def _validate(config):
+    """校验全部输入，非法时抛 :class:`InputError`。"""
+    _check_top(config.top)
+    _check_seed(config.seed)
+
+    # 时长（正整数 + 受支持单位）。
+    amount, unit, _fs = normalize_duration(config.duration)
+
+    _check_sources(config.sources, config.testbench)
 
     return amount, unit
 

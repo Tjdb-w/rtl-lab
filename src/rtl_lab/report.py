@@ -1,9 +1,12 @@
 """JSON 报告的构建与路径脱敏。
 
-报告顶层固定包含：
+单次运行报告（schema_version 1）顶层固定包含：
 ``schema_version``、``tool``、``command``、``sources``、``testbench``、
 ``top``、``duration``、``seed``、``status``、``diagnostics``、
 ``assertions``、``coverage``。
+
+多随机种子回归报告（schema_version 2）将 ``seed`` 扩展为 ``seeds``，
+并新增 ``failed_seeds`` 与按种子顺序排列的 ``runs``。
 """
 
 import json
@@ -12,6 +15,9 @@ import re
 
 #: JSON 报告结构版本，后续功能在此公开报告结构上扩展。
 SCHEMA_VERSION = 1
+
+#: 多随机种子回归报告的结构版本。
+REGRESSION_SCHEMA_VERSION = 2
 
 
 class Report(dict):
@@ -148,17 +154,89 @@ def build_report(*, tool, command, sources, testbench, top, duration, seed,
         "diagnostics": [
             sanitize_text(d, workdir, text_paths) for d in diagnostics
         ],
-        "assertions": [
-            {
-                "name": name,
-                "status": assertions[name]["status"],
-                "fail_count": assertions[name]["fail_count"],
-            }
-            for name in assertions
-        ],
+        "assertions": _assertion_entries(assertions),
         "coverage": [
             {"name": name, "hits": coverage[name]}
             for name in coverage
+        ],
+    }
+
+
+def _assertion_entries(assertions):
+    """把 ``{name: {"status", "fail_count"}}`` 展开为报告数组（保持顺序）。"""
+    return [
+        {
+            "name": name,
+            "status": assertions[name]["status"],
+            "fail_count": assertions[name]["fail_count"],
+        }
+        for name in assertions
+    ]
+
+
+def build_regression_report(*, tool, command, sources, testbench, top,
+                            duration, seeds, status, diagnostics, assertions,
+                            coverage, runs, failed_seeds, workdir,
+                            known_paths=()):
+    """组装多随机种子回归报告 dict（schema_version 2）。
+
+    字段与脱敏规则同 :func:`build_report`，差异：
+
+    - ``seed`` 扩展为 ``seeds``（按执行顺序）；
+    - ``assertions`` / ``coverage`` 为跨种子汇总，按首次出现排序；
+      覆盖率条目额外携带 ``hit_runs``（命中该点的种子数）；
+    - 新增 ``failed_seeds`` 与 ``runs``；``runs`` 依种子顺序，每项含
+      ``seed``、``status``、``diagnostics``、``assertions``、``coverage``。
+
+    :param assertions: 汇总的 ``{name: {"status": ..., "fail_count": int}}``。
+    :param coverage: 汇总的 ``{name: {"hits": int, "hit_runs": int}}``。
+    :param runs: ``[{"seed", "status", "diagnostics", "assertions",
+        "coverage"}]``，其中 ``assertions`` / ``coverage`` 为单次运行的
+        原始映射（coverage 为 ``{name: hits}``）。
+    """
+    safe_command = {
+        stage: sanitize_argv(argv, workdir)
+        for stage, argv in command.items()
+    }
+    text_paths = tuple(list(sources) + [testbench] + list(known_paths))
+    return {
+        "schema_version": REGRESSION_SCHEMA_VERSION,
+        "tool": tool,
+        "command": safe_command,
+        "sources": [sanitize_path(p, workdir) for p in sources],
+        "testbench": sanitize_path(testbench, workdir),
+        "top": top,
+        "duration": duration,
+        "seeds": list(seeds),
+        "status": status,
+        "diagnostics": [
+            sanitize_text(d, workdir, text_paths) for d in diagnostics
+        ],
+        "assertions": _assertion_entries(assertions),
+        "coverage": [
+            {
+                "name": name,
+                "hits": coverage[name]["hits"],
+                "hit_runs": coverage[name]["hit_runs"],
+            }
+            for name in coverage
+        ],
+        "failed_seeds": list(failed_seeds),
+        "runs": [
+            {
+                "seed": run["seed"],
+                "status": run["status"],
+                "diagnostics": [
+                    sanitize_text(d, workdir, text_paths)
+                    for d in run["diagnostics"]
+                ],
+                "assertions": _assertion_entries(run["assertions"]),
+                "coverage": [
+                    {"name": name, "hits": run["coverage"][name]}
+                    for name in run["coverage"]
+                ],
+            }
+            for run in runs
         ],
     }
 
