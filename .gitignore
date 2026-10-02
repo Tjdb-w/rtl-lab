@@ -7,6 +7,7 @@ dist/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.venv/
 
 # 运行期产物
 *.vvp
