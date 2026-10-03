@@ -13,8 +13,8 @@
     rtl-lab verify --run-id ID --duration 100ns \
         --tb FILE[@top[@name]] ... [--cover NAME ...] \
         [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
-        [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
-        [--workdir DIR] [--report report.json] \
+        [--tb-seed NAME=SEED ...] [--seeds INT,INT,...] [--jobs N] \
+        [--baseline PATH] [--workdir DIR] [--report report.json] \
         design1.v [design2.v ...]
 
 退出码：
@@ -96,6 +96,7 @@ def _build_parser():
 
     p_verify = sub.add_parser(
         "verify", help="多测试台统一验证并生成 schema v3 报告"
+        "（--seeds 多种子时为 v5）"
     )
     _add_verify_args(p_verify)
     return parser
@@ -148,7 +149,14 @@ def _add_verify_args(p):
     p.add_argument(
         "--tb-seed", dest="tb_seeds", action="append", default=[],
         metavar="NAME=SEED",
-        help="为指定测试台名设置随机种子（默认 0），可重复",
+        help="为指定测试台名设置随机种子（默认 0），可重复；"
+             "不可与 --seeds 并用",
+    )
+    p.add_argument(
+        "--seeds", dest="seeds", default=None, metavar="INT,INT,...",
+        help="多种子矩阵：逗号分隔的非负整数种子（允许前导零，不可重复）；"
+             "每个未跳过测试台编译一次，按列表顺序逐种子以 +SEED=<seed> "
+             "仿真，生成 schema v5 报告；不可与 --tb-seed 并用",
     )
     p.add_argument(
         "--jobs", dest="jobs", type=int, default=1, metavar="N",
@@ -182,6 +190,8 @@ def _parse_tb_spec(spec):
 
 def _build_verify_config(args):
     """把 verify 命令行参数组装为 :class:`VerifyConfig`。"""
+    if args.seeds is not None and args.tb_seeds:
+        raise InputError("--seeds 与 --tb-seed 不能同时使用")
     skip = set(args.skip)
     optional = set(args.optional)
     seeds = {}
@@ -222,6 +232,7 @@ def _build_verify_config(args):
         report_path=args.report,
         jobs=args.jobs,
         baseline_path=args.baseline,
+        seeds=args.seeds,
     )
 
 

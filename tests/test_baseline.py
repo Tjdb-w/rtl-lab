@@ -102,7 +102,7 @@ def test_load_baseline_non_dict_json(tmp_path):
 
 def test_load_baseline_unsupported_version(tmp_path):
     report = _report()
-    report["schema_version"] = 5
+    report["schema_version"] = 99
     f = tmp_path / "base.json"
     f.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(InputError):

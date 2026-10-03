@@ -1,10 +1,12 @@
-"""验证报告的基线加载与结构化对比（schema v4）。
+"""验证报告的基线加载与结构化对比（schema v4/v5）。
 
 ``verify --baseline PATH`` 把上次 ``verify`` 生成的 JSON 报告作为基线：
 先按原流程执行并生成当前结果（执行顺序、种子、产物目录与字段语义均不
 受影响），再把当前报告与基线按 name 对齐逐类对比——测试台比
 ``status``/``reason``，断言比终态 ``status``/``fail_count``，覆盖率比
-``status``/``hits``/``hit_testbenches``。
+``status``/``hits``/``hit_testbenches``。不带 ``--seeds`` 的当前报告
+追加 ``comparison`` 后升为 schema v4；多种子（``--seeds``）当前报告
+保持 schema v5，同样在最后追加 ``comparison``。
 
 每条差异固定为 ``kind``、``name``、``expected``、``actual`` 四个字段：
 
@@ -26,13 +28,16 @@ from .report import (
     VERIFICATION_COMPARISON_SCHEMA_VERSION,
     VERIFICATION_FORMAT,
     VERIFICATION_SCHEMA_VERSION,
+    VERIFICATION_SEEDS_SCHEMA_VERSION,
     sanitize_path,
 )
 
-#: 可作为基线读取的报告版本（v3 原始报告与 v4 带对比报告均可）。
+#: 可作为基线读取的报告版本（v3 原始报告、v4 带对比报告与 v5 多种子
+#: 报告均可；对比只按 name 对齐既有字段，v5 的 seeds/runs 不参与）。
 SUPPORTED_BASELINE_SCHEMA_VERSIONS = (
     VERIFICATION_SCHEMA_VERSION,
     VERIFICATION_COMPARISON_SCHEMA_VERSION,
+    VERIFICATION_SEEDS_SCHEMA_VERSION,
 )
 
 #: 各类别参与对比的字段；顺序即同名多个字段差异的稳定排列顺序。

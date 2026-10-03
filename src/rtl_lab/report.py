@@ -17,6 +17,15 @@
 带基线对比的统一验证报告（``verify --baseline``，schema v4）在 v3
 字段及顺序之后追加 ``comparison``（基线路径、无差异标记与结构化差异）；
 对比逻辑见 :mod:`rtl_lab.baseline`。
+
+多种子统一验证报告（``verify --seeds``，schema v5）保持 v3 的顶层字段
+与汇总语义，``testbenches`` 条目在既有字段之后追加 ``seeds`` 与
+``runs``：每个未跳过的测试台编译一次，按种子顺序逐种子仿真，``runs``
+逐项记录 ``seed``、``status``、``reason``、``diagnostics``、
+``assertions``、``coverage`` 与 ``simulate`` 命令；条目级断言/覆盖率为
+跨种子汇总（断言按名聚合终态并累加 ``fail_count``，覆盖率按名累加
+``hits``），``hit_testbenches`` 仍按测试台去重。多种子报告同样支持
+``--baseline``：schema 保持 v5，``comparison`` 追加在最后。
 """
 
 import json
@@ -35,6 +44,11 @@ VERIFICATION_SCHEMA_VERSION = 3
 #: 带基线对比的统一验证报告结构版本（v3 字段及顺序之后追加
 #: ``comparison``；仅 ``verify --baseline`` 产出）。
 VERIFICATION_COMPARISON_SCHEMA_VERSION = 4
+
+#: 多种子统一验证报告结构版本（``testbenches`` 条目在既有字段之后追加
+#: ``seeds`` 与 ``runs``；仅 ``verify --seeds`` 产出，可再叠加
+#: ``--baseline`` 的 ``comparison``）。
+VERIFICATION_SEEDS_SCHEMA_VERSION = 5
 
 #: 统一验证报告的格式标识（旧读取逻辑据此与 v1/v2 区分）。
 VERIFICATION_FORMAT = "rtl-lab-verification"
@@ -351,8 +365,9 @@ def _merge_coverage(coverage_by_tb):
 def build_verification_report(*, run_id, sources, testbench_files,
                               coverage_config, duration,
                               compile_command, simulate_command,
-                              outcomes, generated_at, workdir, known_paths=()):
-    """组装统一验证报告 dict（schema v3）。
+                              outcomes, generated_at, workdir, known_paths=(),
+                              multi_seed=False):
+    """组装统一验证报告 dict（schema v3；``multi_seed=True`` 时为 v5）。
 
     纯函数：不做落盘、不做归属校验之外的副作用。数组顺序稳定——
     ``sources`` 按编译范围输入顺序；``testbenches`` 按 ``outcomes`` 给定
@@ -371,8 +386,14 @@ def build_verification_report(*, run_id, sources, testbench_files,
         diagnostics/reason/commands；status ∈ passed/failed/skipped，reason
         为稳定枚举（passed/compilation_failed/simulation_failed/
         assertion_failed/incomplete_statistics/skipped），commands 为
-        ``{"compile": argv, "simulate": argv}``。
+        ``{"compile": argv, "simulate": argv}``。``multi_seed=True`` 时
+        每项另含 ``seeds``（种子列表）与 ``runs``（逐种子结果，顺序与
+        ``seeds`` 一致；每项含 seed/status/reason/diagnostics/assertions/
+        coverage 与 ``command["simulate"]``），条目级 assertions/coverage
+        为调用方已完成的跨种子汇总。
     :param generated_at: 调用方提供的报告生成时间字符串（允许跨复现变化）。
+    :param multi_seed: True 时产出 schema v5：``testbenches`` 条目在既有
+        字段之后追加 ``seeds`` 与 ``runs``，顶层字段与汇总语义不变。
     :returns: ``(data, result)``；result 为总体结论 passed/failed。
     """
     threshold = float(coverage_config["threshold"])
@@ -395,7 +416,7 @@ def build_verification_report(*, run_id, sources, testbench_files,
     for o in outcomes:
         if o["status"] not in TB_STATUSES:
             raise RuntimeError(f"测试台状态非法：{o['status']!r}")
-        safe_outcomes.append({
+        safe = {
             "name": o["name"],
             "top": o["top"],
             "testbench": sanitize_path(o["testbench_file"], workdir),
@@ -416,7 +437,33 @@ def build_verification_report(*, run_id, sources, testbench_files,
                 {"name": name, "hits": o["coverage"][name]}
                 for name in o["coverage"]
             ],
-        })
+        }
+        if multi_seed:
+            # v5：既有字段之后追加 seeds 与逐种子 runs（顺序与 seeds 一致）。
+            safe["seeds"] = list(o["seeds"])
+            safe["runs"] = [
+                {
+                    "seed": r["seed"],
+                    "status": r["status"],
+                    "reason": r["reason"],
+                    "diagnostics": [
+                        sanitize_text(d, workdir, text_paths)
+                        for d in r["diagnostics"]
+                    ],
+                    "assertions": _assertion_entries(r["assertions"]),
+                    "coverage": [
+                        {"name": name, "hits": r["coverage"][name]}
+                        for name in r["coverage"]
+                    ],
+                    "command": {
+                        "simulate": sanitize_argv(
+                            r["command"]["simulate"], workdir
+                        ),
+                    },
+                }
+                for r in o["runs"]
+            ]
+        safe_outcomes.append(safe)
         tb_counts[o["status"]] += 1
         if o["status"] == "skipped" and o["required"]:
             skipped_required.append(o["name"])
@@ -489,7 +536,10 @@ def build_verification_report(*, run_id, sources, testbench_files,
         result = "failed"
 
     data = {
-        "schema_version": VERIFICATION_SCHEMA_VERSION,
+        "schema_version": (
+            VERIFICATION_SEEDS_SCHEMA_VERSION if multi_seed
+            else VERIFICATION_SCHEMA_VERSION
+        ),
         "format": VERIFICATION_FORMAT,
         "run_id": run_id,
         "result": result,
