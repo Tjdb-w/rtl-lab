@@ -3,18 +3,18 @@
 用法::
 
     rtl-lab run --tb TB.v --top top_module --duration 100ns \
-        [--workdir DIR] [--seed N] [--report report.json] \
+        [--workdir DIR] [--seed N] [--timeout SECONDS] [--report report.json] \
         design1.v [design2.v ...]
 
     rtl-lab regress --tb TB.v --top top_module --duration 100ns \
-        --seeds 1,2,3 [--workdir DIR] [--report report.json] \
-        design1.v [design2.v ...]
+        --seeds 1,2,3 [--workdir DIR] [--timeout SECONDS] \
+        [--report report.json] design1.v [design2.v ...]
 
     rtl-lab verify --run-id ID --duration 100ns \
         --tb FILE[@top[@name]] ... [--cover NAME ...] \
         [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
         [--tb-seed NAME=SEED ...] [--seeds INT,INT,...] \
-        [--jobs N] [--baseline PATH] \
+        [--jobs N] [--baseline PATH] [--timeout SECONDS] \
         [--workdir DIR] [--report report.json] \
         design1.v [design2.v ...]
 
@@ -77,6 +77,11 @@ def _add_common_args(p, *, with_seed):
     p.add_argument(
         "--report", dest="report", default=None, metavar="PATH",
         help="JSON 报告输出路径",
+    )
+    p.add_argument(
+        "--timeout", dest="timeout", default=None, metavar="SECONDS",
+        help="每次 iverilog/vvp 进程调用的墙钟超时（正十进制整数秒）；"
+             "超时终止该进程并归入对应阶段失败，省略则不限制",
     )
 
 
@@ -172,6 +177,11 @@ def _add_verify_args(p):
         "--report", dest="report", default=None, metavar="PATH",
         help="JSON 报告输出路径",
     )
+    p.add_argument(
+        "--timeout", dest="timeout", default=None, metavar="SECONDS",
+        help="每次 iverilog/vvp 进程调用的墙钟超时（正十进制整数秒）；"
+             "超时终止该进程并归入对应阶段失败，省略则不限制",
+    )
 
 
 def _parse_tb_spec(spec):
@@ -239,6 +249,7 @@ def _build_verify_config(args):
         jobs=args.jobs,
         baseline_path=args.baseline,
         seeds=matrix_seeds,
+        timeout=args.timeout,
     )
 
 
@@ -313,6 +324,7 @@ def main(argv=None):
                 workdir=args.workdir,
                 seed=args.seed,
                 report_path=args.report,
+                timeout=args.timeout,
             )
             report = run(config)
         elif args.command == "regress":
@@ -325,6 +337,7 @@ def main(argv=None):
                 seeds=parse_seeds(args.seeds),
                 workdir=args.workdir,
                 report_path=args.report,
+                timeout=args.timeout,
             )
             report = regress(config)
         else:

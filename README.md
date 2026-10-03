@@ -13,7 +13,7 @@
 ```bash
 rtl-lab run design1.v [design2.v ...] \
     --tb tb.v --top tb --duration 100ns \
-    [--workdir DIR] [--seed N] [--report report.json]
+    [--workdir DIR] [--seed N] [--timeout SECONDS] [--report report.json]
 ```
 
 编译一次、以 `+SEED=<seed>` 执行一次仿真，生成 schema v1 报告。
@@ -24,7 +24,7 @@ rtl-lab run design1.v [design2.v ...] \
 rtl-lab regress design1.v [design2.v ...] \
     --tb tb.v --top tb --duration 100ns \
     --seeds 1,2,3 \
-    [--workdir DIR] [--report report.json]
+    [--workdir DIR] [--timeout SECONDS] [--report report.json]
 ```
 
 源文件、测试台、顶层、时长、工作目录与可选 `--report` 与 `run` 相同；
@@ -50,6 +50,27 @@ report = regress(RegressConfig(
 ))
 ```
 
+### 进程超时
+
+三个命令均可选 `--timeout SECONDS`（Python 入口为配置对象的
+`timeout`）：对每次独立启动的 `iverilog` / `vvp` 进程分别施加墙钟
+超时，计时从进程启动到自然结束，与仿真时长无关。只接受正十进制整数
+秒；省略则不限制，零、负数、小数、非数字或空值均为输入错误（退出 2，
+不生成或覆盖报告）。
+
+`run` 的编译与仿真分别计时；`regress` 编译一次后按种子分别计时；
+`verify` 每个测试台独立编译、每个种子独立仿真，各次调用独立计时，
+`--jobs` 只并行测试台，不合并或平均各次调用的预算。达到上限时终止
+该次进程及其残留子进程，保留已捕获的 stdout，并在该阶段 stderr
+末尾追加稳定标记 `RTL_LAB_PROCESS_TIMEOUT`（对应 diagnostics 同样
+包含该标记）。
+
+超时归入既有阶段失败，不新增报告版本：编译超时等同编译失败
+（`run`/`regress` 退出 3；`verify` 该测试台 `compilation_failed`，
+多种子时 `runs` 为空）；仿真超时等同仿真非零退出（`run`/`regress`
+退出 5；`verify` 当前种子 `simulation_failed` 并停止该台后续种子，
+`regress` 保留此前种子结果后停止）。
+
 ### 统一验证
 
 ```bash
@@ -58,7 +79,7 @@ rtl-lab verify design1.v [design2.v ...] \
     --tb FILE[@TOP[@NAME]] ... [--cover NAME ...] \
     [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
     [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
-    [--workdir DIR] [--report report.json]
+    [--timeout SECONDS] [--workdir DIR] [--report report.json]
 ```
 
 每个测试台在工作目录下的独立子目录中独立编译、独立仿真；`--jobs N`

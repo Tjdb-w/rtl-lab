@@ -35,6 +35,11 @@
 测试台失败、断言失败或覆盖率低于阈值时仍生成完整报告，总体 ``result``
 记为 ``failed``；只有全部检查通过且没有跳过必测项才记为 ``passed``。
 
+可选 ``timeout``（正整数秒）对每次独立启动的 iverilog/vvp 进程分别
+计时：超时即终止该进程并在该阶段 stderr 追加稳定标记
+``RTL_LAB_PROCESS_TIMEOUT``；编译超时等同编译失败（多种子时 runs 为
+空），仿真超时等同仿真非零退出（多种子时停止该台后续种子）。
+
 基线对比（``VerifyConfig.baseline_path``）：先按原流程生成当前结果，再把
 当前报告与上次 ``verify`` 生成的基线报告按 name 对齐对比
 （testbenches、assertions、coverage），在既有字段之后追加 ``comparison``；
@@ -62,7 +67,12 @@ from .report import (
     ensure_report_writable,
     write_report,
 )
-from .runner import SOURCE_SUFFIXES, _prepare_and_compile, parse_seeds  # noqa: PLC2701
+from .runner import (  # noqa: PLC2701
+    SOURCE_SUFFIXES,
+    _prepare_and_compile,
+    parse_seeds,
+    parse_timeout,
+)
 from .tools import run_simulation
 
 #: 测试台原因枚举（稳定取值，不依赖平台文本）。
@@ -187,6 +197,10 @@ class VerifyConfig:
         测试台编译一次、按列表顺序逐种子以 ``+SEED=<seed>`` 仿真，产出
         schema v5 报告。与 :attr:`TestSpec.seed`（``--tb-seed``）语义
         互斥：矩阵种子非空时各测试台不得另行指定种子。
+    :param timeout: 每次 iverilog/vvp 进程调用的墙钟超时（正整数秒，
+        也接受十进制字符串，由 :func:`rtl_lab.runner.parse_timeout`
+        解析）；None 表示不限制。每个测试台独立编译、每个种子独立仿真，
+        各次进程调用分别计时，不合并或平均预算。
     """
 
     sources: list
@@ -199,6 +213,7 @@ class VerifyConfig:
     jobs: int = 1
     baseline_path: str = None
     seeds: object = None
+    timeout: object = None
 
     def __post_init__(self):
         self.sources = list(self.sources)
@@ -220,6 +235,9 @@ class VerifyConfig:
             self.seeds = []
         else:
             self.seeds = parse_seeds(self.seeds)
+        # 超时沿用统一的正整数秒解析（零/负数/小数/非数字/空值均为
+        # InputError）；None 表示不限制。
+        self.timeout = parse_timeout(self.timeout)
 
 
 def _validate(config):
@@ -283,18 +301,19 @@ def _validate(config):
 class _TbConfig:
     """复用 runner 编译逻辑所需的最小配置视图。"""
 
-    def __init__(self, sources, testbench, top, workdir):
+    def __init__(self, sources, testbench, top, workdir, timeout=None):
         self.sources = sources
         self.testbench = testbench
         self.top = top
         self.workdir = workdir
+        self.timeout = timeout
 
 
-def _simulate_once(vvp_output, tb_workdir, seed):
+def _simulate_once(vvp_output, tb_workdir, seed, timeout=None):
     """执行一次仿真并解析结果，返回 (rc, collector, diagnostics, command)。"""
     rc, sout, serr, run_command = run_simulation(
         vvp_path=os.path.basename(vvp_output),
-        seed=seed, cwd=tb_workdir,
+        seed=seed, cwd=tb_workdir, timeout=timeout,
     )
     collector = ResultCollector()
     collector.feed_text(sout)
@@ -330,7 +349,8 @@ def _run_single_seed(spec, config, amount, unit, run_token, tb_dir):
     tb_workdir = os.path.abspath(os.path.join(config.workdir, tb_dir))
     os.makedirs(tb_workdir, exist_ok=True)
     tb_config = _TbConfig(
-        config.sources, spec.testbench, spec.top, tb_workdir
+        config.sources, spec.testbench, spec.top, tb_workdir,
+        timeout=config.timeout,
     )
 
     (vvp_output, watchdog_path,
@@ -363,7 +383,7 @@ def _run_single_seed(spec, config, amount, unit, run_token, tb_dir):
         }
 
     rc, collector, sim_diagnostics, run_command = _simulate_once(
-        vvp_output, tb_workdir, spec.seed
+        vvp_output, tb_workdir, spec.seed, timeout=config.timeout
     )
     diagnostics.extend(sim_diagnostics)
 
@@ -459,7 +479,8 @@ def _run_seed_matrix(spec, config, amount, unit, run_token, tb_dir):
     tb_workdir = os.path.abspath(os.path.join(config.workdir, tb_dir))
     os.makedirs(tb_workdir, exist_ok=True)
     tb_config = _TbConfig(
-        config.sources, spec.testbench, spec.top, tb_workdir
+        config.sources, spec.testbench, spec.top, tb_workdir,
+        timeout=config.timeout,
     )
 
     (vvp_output, watchdog_path,
@@ -496,7 +517,7 @@ def _run_seed_matrix(spec, config, amount, unit, run_token, tb_dir):
     hard_stop = False
     for seed in seeds:
         rc, collector, sim_diagnostics, run_command = _simulate_once(
-            vvp_output, tb_workdir, seed
+            vvp_output, tb_workdir, seed, timeout=config.timeout
         )
         run_status, run_reason = _classify_seed_run(rc, collector)
         runs.append({

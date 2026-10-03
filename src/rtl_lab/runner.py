@@ -8,11 +8,16 @@
 
 单次流程：
 
-1. 校验输入（源文件存在性与后缀、顶层名、时长、种子）；
+1. 校验输入（源文件存在性与后缀、顶层名、时长、种子、超时）；
 2. 按给定顺序编译设计源文件与测试台，以顶层模块为根，并注入仿真时长看门狗；
 3. 执行仿真，随机种子通过 ``+SEED=<seed>`` plusarg 传入测试台；
 4. 完整保留仿真 stdout/stderr，解析 ASSERT/COVER 记录；
 5. 生成 JSON 报告并在需要时抛出对应异常。
+
+可选 ``timeout``（正整数秒）对每次独立启动的 iverilog/vvp 进程分别计时；
+超时即终止该进程并在该阶段 stderr 追加稳定标记
+``RTL_LAB_PROCESS_TIMEOUT``，按既有阶段失败处理（编译超时同编译失败，
+仿真超时同仿真失败）。
 """
 
 import os
@@ -54,10 +59,12 @@ class RunConfig:
     :param workdir: 工作目录（编译产物与临时文件置于其中）。
     :param seed: 随机种子（非负整数）。
     :param report_path: JSON 报告输出路径，可为 None。
+    :param timeout: 每次 iverilog/vvp 进程调用的墙钟超时（正整数秒），
+        None 表示不限制。
     """
 
     def __init__(self, *, sources, testbench, top, duration,
-                 workdir=".", seed=0, report_path=None):
+                 workdir=".", seed=0, report_path=None, timeout=None):
         self.sources = list(sources)
         self.testbench = testbench
         self.top = top
@@ -65,6 +72,7 @@ class RunConfig:
         self.workdir = workdir
         self.seed = seed
         self.report_path = report_path
+        self.timeout = timeout
 
 
 class RegressConfig:
@@ -77,7 +85,7 @@ class RegressConfig:
     """
 
     def __init__(self, *, sources, testbench, top, duration, seeds,
-                 workdir=".", report_path=None):
+                 workdir=".", report_path=None, timeout=None):
         self.sources = list(sources)
         self.testbench = testbench
         self.top = top
@@ -85,6 +93,7 @@ class RegressConfig:
         self.seeds = list(seeds) if not isinstance(seeds, str) else seeds
         self.workdir = workdir
         self.report_path = report_path
+        self.timeout = timeout
 
 
 def parse_seeds(value):
@@ -125,6 +134,34 @@ def parse_seeds(value):
     return seeds
 
 
+def parse_timeout(value):
+    """解析 ``--timeout`` 的正十进制整数秒数。
+
+    ``None`` 表示不限制（返回 ``None``）；零、负数、小数、非数字或空值
+    均抛 :class:`InputError`。接受字符串（允许前导零与首尾空白）或整数
+    （bool 不视为整数）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise InputError(f"超时必须为正整数秒，收到 {value!r}")
+    if isinstance(value, int):
+        timeout = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise InputError("超时不能为空")
+        # 仅接受纯十进制无符号整数（允许前导零），拒绝 +3、3.0、1e3 等。
+        if not text.isdigit():
+            raise InputError(f"超时必须为正整数秒，收到 {value!r}")
+        timeout = int(text)
+    else:
+        raise InputError(f"超时必须为正整数秒，收到 {value!r}")
+    if timeout <= 0:
+        raise InputError(f"超时必须为正整数秒，收到 {value!r}")
+    return timeout
+
+
 def _validate_common(*, sources, testbench, top, duration):
     """校验源文件、测试台、顶层名与时长，返回规范化 ``(amount, unit)``。"""
     if not isinstance(top, str) or not top.strip():
@@ -157,6 +194,7 @@ def _validate(config):
         raise InputError(f"随机种子必须为非负整数，收到 {config.seed!r}")
     if config.seed < 0:
         raise InputError(f"随机种子不能为负数，收到 {config.seed}")
+    config.timeout = parse_timeout(config.timeout)
 
     return _validate_common(
         sources=config.sources, testbench=config.testbench,
@@ -166,6 +204,7 @@ def _validate(config):
 
 def _validate_regress(config):
     """校验回归配置：通用字段 + 种子列表。"""
+    config.timeout = parse_timeout(config.timeout)
     amount, unit = _validate_common(
         sources=config.sources, testbench=config.testbench,
         top=config.top, duration=config.duration,
@@ -223,6 +262,7 @@ def _prepare_and_compile(config, amount, unit):
         top=config.top.strip(),
         output_path=vvp_output,
         extra_roots=[WATCHDOG_MODULE],
+        timeout=config.timeout,
     )
     return vvp_output, watchdog_path, rc, cout, cerr, compile_command
 
@@ -272,7 +312,8 @@ def run(config=None, **kwargs):
     # vvp 以工作目录为 cwd 运行，故产物使用 basename 定位。
     rc, sout, serr, run_command = run_simulation(
         vvp_path=os.path.basename(vvp_output),
-        seed=config.seed, cwd=config.workdir
+        seed=config.seed, cwd=config.workdir,
+        timeout=config.timeout,
     )
 
     collector = ResultCollector()
@@ -417,6 +458,7 @@ def regress(config=None, **kwargs):
         rc, sout, serr, run_command = run_simulation(
             vvp_path=os.path.basename(vvp_output),
             seed=seed, cwd=config.workdir,
+            timeout=config.timeout,
         )
         stdout_parts.append(sout)
         stderr_parts.append(serr)
