@@ -13,7 +13,8 @@
     rtl-lab verify --run-id ID --duration 100ns \
         --tb FILE[@top[@name]] ... [--cover NAME ...] \
         [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
-        [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
+        [--tb-seed NAME=SEED ...] [--seeds INT,INT,...] \
+        [--jobs N] [--baseline PATH] \
         [--workdir DIR] [--report report.json] \
         design1.v [design2.v ...]
 
@@ -26,7 +27,7 @@
 - 5：仿真进程非零退出（生成 simulation_failed 报告）；
 - 6：断言失败（生成 assertion_failed 报告）；
 - 7：统一验证总体结论 failed 或基线对比存在差异（仍生成完整
-  verify 报告）；
+  verify 报告；单种子为 schema v3/v4，``--seeds`` 多种子为 schema v5）；
 - 8：verify 前置条件失败（run_id 为空、输出位置不可写、结果归属/命名
   冲突、无可执行测试台或无任何覆盖率结果；不生成或覆盖报告）。
 """
@@ -95,7 +96,8 @@ def _build_parser():
     _add_common_args(p_regress, with_seed=False)
 
     p_verify = sub.add_parser(
-        "verify", help="多测试台统一验证并生成 schema v3 报告"
+        "verify",
+        help="多测试台统一验证（可多种子矩阵）并生成验证报告",
     )
     _add_verify_args(p_verify)
     return parser
@@ -148,7 +150,14 @@ def _add_verify_args(p):
     p.add_argument(
         "--tb-seed", dest="tb_seeds", action="append", default=[],
         metavar="NAME=SEED",
-        help="为指定测试台名设置随机种子（默认 0），可重复",
+        help="为指定测试台名设置随机种子（默认 0），可重复；"
+             "不可与 --seeds 并用",
+    )
+    p.add_argument(
+        "--seeds", dest="seeds", default=None, metavar="INT,INT,...",
+        help="多种子矩阵：逗号分隔的非负整数种子（允许前导零，不可重复）；"
+             "给出后每个未跳过测试台编译一次，并按顺序逐种子以 "
+             "+SEED=<seed> 仿真，产出 schema v5 报告；不可与 --tb-seed 并用",
     )
     p.add_argument(
         "--jobs", dest="jobs", type=int, default=1, metavar="N",
@@ -184,6 +193,12 @@ def _build_verify_config(args):
     """把 verify 命令行参数组装为 :class:`VerifyConfig`。"""
     skip = set(args.skip)
     optional = set(args.optional)
+
+    # 多种子矩阵与逐测试台种子互斥；两者同时给出即输入错误（退出 2）。
+    matrix_seeds = parse_seeds(args.seeds) if args.seeds is not None else None
+    if matrix_seeds and args.tb_seeds:
+        raise InputError("--seeds 不可与 --tb-seed 并用")
+
     seeds = {}
     for item in args.tb_seeds:
         if "=" not in item:
@@ -202,6 +217,7 @@ def _build_verify_config(args):
             testbench=path, top=top, name=name,
             required=tname not in optional,
             skip=tname in skip,
+            # 多种子矩阵下逐台种子统一为 0，实际种子由矩阵列表提供。
             seed=seeds.get(tname, 0),
         ))
 
@@ -222,6 +238,7 @@ def _build_verify_config(args):
         report_path=args.report,
         jobs=args.jobs,
         baseline_path=args.baseline,
+        seeds=matrix_seeds,
     )
 
 

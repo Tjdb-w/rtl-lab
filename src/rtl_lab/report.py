@@ -17,6 +17,11 @@
 带基线对比的统一验证报告（``verify --baseline``，schema v4）在 v3
 字段及顺序之后追加 ``comparison``（基线路径、无差异标记与结构化差异）；
 对比逻辑见 :mod:`rtl_lab.baseline`。
+
+多种子统一验证报告（``verify --seeds``，schema v5）：测试台条目在既有
+字段之后新增 ``seeds`` 与 ``runs``；编译一次，按种子列表顺序依次以
+``+SEED=<seed>`` 仿真。顶层断言/覆盖率为该台跨种子聚合后再跨台聚合。
+``--seeds --baseline`` 同样产出 schema v5（``comparison`` 仍追加在最后）。
 """
 
 import json
@@ -36,6 +41,10 @@ VERIFICATION_SCHEMA_VERSION = 3
 #: ``comparison``；仅 ``verify --baseline`` 产出）。
 VERIFICATION_COMPARISON_SCHEMA_VERSION = 4
 
+#: 多种子矩阵统一验证报告结构版本（``verify --seeds``；``--baseline``
+#: 不再升版，仅在 v5 字段之后追加 ``comparison``）。
+VERIFICATION_MULTISEED_SCHEMA_VERSION = 5
+
 #: 统一验证报告的格式标识（旧读取逻辑据此与 v1/v2 区分）。
 VERIFICATION_FORMAT = "rtl-lab-verification"
 
@@ -44,6 +53,18 @@ TOOL_NAME_VERIFICATION = "icarus-verilog"
 
 #: 测试台终态枚举（顺序即报告中的稳定排列依据之外的取值域）。
 TB_STATUSES = ("passed", "failed", "skipped")
+
+#: 多种子矩阵中单个种子运行的终态枚举（testbenches[].runs[].status）。
+RUN_STATUSES = ("passed", "failed")
+
+#: 多种子矩阵中单个种子运行的原因枚举（runs[].reason）；
+#: 编译失败没有 runs，跳过的测试台 runs 为空。
+RUN_REASONS = (
+    "passed",
+    "simulation_failed",
+    "assertion_failed",
+    "incomplete_statistics",
+)
 
 #: 覆盖率点状态枚举：hit=至少命中一次；missed=已统计但零命中；
 #: unavailable=配置点名但无任何统计。
@@ -351,8 +372,9 @@ def _merge_coverage(coverage_by_tb):
 def build_verification_report(*, run_id, sources, testbench_files,
                               coverage_config, duration,
                               compile_command, simulate_command,
-                              outcomes, generated_at, workdir, known_paths=()):
-    """组装统一验证报告 dict（schema v3）。
+                              outcomes, generated_at, workdir, known_paths=(),
+                              seeds=None):
+    """组装统一验证报告 dict（schema v3；给定 ``seeds`` 时为 schema v5）。
 
     纯函数：不做落盘、不做归属校验之外的副作用。数组顺序稳定——
     ``sources`` 按编译范围输入顺序；``testbenches`` 按 ``outcomes`` 给定
@@ -364,6 +386,13 @@ def build_verification_report(*, run_id, sources, testbench_files,
     并集）；配置要求但无任何统计的点记为 ``unavailable``，计入分母并拉低
     覆盖率。是否达标由聚合比率与阈值比较。
 
+    多种子矩阵（``seeds`` 非空，schema v5）：每个测试台编译一次，条目在
+    既有字段之后追加 ``seeds``（种子列表）与 ``runs``（按种子顺序的每种子
+    结果；编译失败时为空）。run 条目恰含 seed、status、reason、diagnostics、
+    assertions、coverage、simulate 七个字段；断言按名取跨种子终态并累加
+    fail_count，coverage hits 跨种子累加后再跨台合并（hit_testbenches
+    去重）。不给定 ``seeds`` 时输出与 schema v3 完全一致。
+
     :param testbench_files: 选择的测试台源文件路径列表（按选择顺序）。
     :param coverage_config: ``{"threshold": float, "points": [名称...]}``。
     :param outcomes: 按选择顺序的结果 dict 列表，每项含
@@ -371,12 +400,17 @@ def build_verification_report(*, run_id, sources, testbench_files,
         diagnostics/reason/commands；status ∈ passed/failed/skipped，reason
         为稳定枚举（passed/compilation_failed/simulation_failed/
         assertion_failed/incomplete_statistics/skipped），commands 为
-        ``{"compile": argv, "simulate": argv}``。
+        ``{"compile": argv, "simulate": argv}``。多种子结果改用
+        ``seeds``（该台种子列表）与 ``runs``（每项含 seed/status/reason/
+        diagnostics/assertions/coverage/command{"simulate": argv}），
+        此时条目级 assertions/coverage 仅用于跳过/编译失败的空结果。
     :param generated_at: 调用方提供的报告生成时间字符串（允许跨复现变化）。
+    :param seeds: 本次矩阵的非负整数种子列表；None 或空表示单种子 v3。
     :returns: ``(data, result)``；result 为总体结论 passed/failed。
     """
     threshold = float(coverage_config["threshold"])
     configured_points = list(dict.fromkeys(coverage_config.get("points") or []))
+    multiseed = bool(seeds)
     text_paths = tuple(
         list(sources) + list(testbench_files) + list(known_paths)
     )
@@ -392,10 +426,19 @@ def build_verification_report(*, run_id, sources, testbench_files,
     agg_assertions = {}
     coverage_by_tb = []
 
+    def _consume_assertions(assertions):
+        for name, entry in assertions.items():
+            agg = agg_assertions.setdefault(
+                name, {"status": "passed", "fail_count": 0}
+            )
+            agg["fail_count"] += entry["fail_count"]
+            if entry["status"] == "failed":
+                agg["status"] = "failed"
+
     for o in outcomes:
         if o["status"] not in TB_STATUSES:
             raise RuntimeError(f"测试台状态非法：{o['status']!r}")
-        safe_outcomes.append({
+        entry = {
             "name": o["name"],
             "top": o["top"],
             "testbench": sanitize_path(o["testbench_file"], workdir),
@@ -411,25 +454,86 @@ def build_verification_report(*, run_id, sources, testbench_files,
             "diagnostics": [
                 sanitize_text(d, workdir, text_paths) for d in o["diagnostics"]
             ],
-            "assertions": _assertion_entries(o["assertions"]),
-            "coverage": [
+        }
+
+        tb_coverage = {}
+        tb_assertions = {}
+        tb_seeds = []
+        safe_runs = []
+        if multiseed:
+            # v5：每个条目都带 seeds 与 runs；跳过或编译失败时 runs 为空。
+            tb_seeds = list(o.get("seeds", ()))
+            raw_runs = list(o.get("runs", ()))
+            if o["reason"] in ("compilation_failed", "skipped"):
+                if raw_runs:
+                    raise RuntimeError(
+                        f"{o['reason']} 的测试台不应包含 runs"
+                    )
+            elif not raw_runs:
+                raise RuntimeError("已仿真测试台的 runs 不能为空")
+            expected_prefix = tb_seeds[:len(raw_runs)]
+            seen_run_seeds = []
+            for run in raw_runs:
+                if run["status"] not in RUN_STATUSES:
+                    raise RuntimeError(f"种子运行状态非法：{run['status']!r}")
+                if run["reason"] not in RUN_REASONS:
+                    raise RuntimeError(f"种子运行原因非法：{run['reason']!r}")
+                seen_run_seeds.append(run["seed"])
+                safe_runs.append({
+                    "seed": run["seed"],
+                    "status": run["status"],
+                    "reason": run["reason"],
+                    "diagnostics": [
+                        sanitize_text(d, workdir, text_paths)
+                        for d in run["diagnostics"]
+                    ],
+                    "assertions": _assertion_entries(run["assertions"]),
+                    "coverage": [
+                        {"name": name, "hits": run["coverage"][name]}
+                        for name in run["coverage"]
+                    ],
+                    "simulate": sanitize_argv(
+                        run["command"]["simulate"], workdir
+                    ),
+                })
+                # 该台跨种子：断言按名取终态、累加 fail_count；
+                # coverage 按名累加 hits（顶层再跨台、hit_testbenches 去重）。
+                for rname, rentry in run["assertions"].items():
+                    agg_tb = tb_assertions.setdefault(
+                        rname, {"status": "passed", "fail_count": 0}
+                    )
+                    agg_tb["fail_count"] += rentry["fail_count"]
+                    if rentry["status"] == "failed":
+                        agg_tb["status"] = "failed"
+                for name, hits in run["coverage"].items():
+                    tb_coverage[name] = tb_coverage.get(name, 0) + hits
+                _consume_assertions(run["assertions"])
+            if seen_run_seeds != expected_prefix:
+                raise RuntimeError(
+                    "runs 的种子必须与种子列表顺序一致且为其前缀"
+                )
+            entry["assertions"] = _assertion_entries(tb_assertions)
+            entry["coverage"] = [
+                {"name": name, "hits": tb_coverage[name]}
+                for name in tb_coverage
+            ]
+            entry["seeds"] = tb_seeds
+            entry["runs"] = safe_runs
+        else:
+            entry["assertions"] = _assertion_entries(o["assertions"])
+            entry["coverage"] = [
                 {"name": name, "hits": o["coverage"][name]}
                 for name in o["coverage"]
-            ],
-        })
+            ]
+            _consume_assertions(o["assertions"])
+            tb_coverage = dict(o["coverage"])
+
+        safe_outcomes.append(entry)
         tb_counts[o["status"]] += 1
         if o["status"] == "skipped" and o["required"]:
             skipped_required.append(o["name"])
 
-        for name, entry in o["assertions"].items():
-            agg = agg_assertions.setdefault(
-                name, {"status": "passed", "fail_count": 0}
-            )
-            agg["fail_count"] += entry["fail_count"]
-            if entry["status"] == "failed":
-                agg["status"] = "failed"
-
-        coverage_by_tb.append((o["name"], o["coverage"]))
+        coverage_by_tb.append((o["name"], tb_coverage))
 
     merged = _merge_coverage(coverage_by_tb)
 
@@ -489,7 +593,10 @@ def build_verification_report(*, run_id, sources, testbench_files,
         result = "failed"
 
     data = {
-        "schema_version": VERIFICATION_SCHEMA_VERSION,
+        "schema_version": (
+            VERIFICATION_MULTISEED_SCHEMA_VERSION if multiseed
+            else VERIFICATION_SCHEMA_VERSION
+        ),
         "format": VERIFICATION_FORMAT,
         "run_id": run_id,
         "result": result,

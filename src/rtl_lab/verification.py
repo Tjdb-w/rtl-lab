@@ -1,4 +1,4 @@
-"""统一验证执行：多测试台编译/仿真编排与可复现报告（schema v3）。
+"""统一验证执行：多测试台编译/仿真编排与可复现报告（schema v3/v5）。
 
 在 ``run`` / ``regress`` 之上提供新的公开入口 :func:`verify`：
 
@@ -6,7 +6,22 @@
   位置与运行标识 ``run_id``；
 - 每个测试台独立编译、独立仿真（各自产物置于工作目录下的独立子目录），
   可选择并发执行，但结果一律按测试选择顺序收集；
-- 产出 schema v3 统一验证报告，字段与顺序稳定，可复现、可追溯。
+- 默认产出 schema v3 统一验证报告，字段与顺序稳定，可复现、可追溯。
+
+多种子矩阵（``VerifyConfig.seeds`` 非空，schema v5）：
+
+- ``--jobs`` 的并发只发生在测试台之间；每个未跳过测试台只编译一次，
+  同一测试台的种子按列表顺序串行以 ``+SEED=<seed>`` 仿真；
+- 结果按测试选择顺序、同台按种子顺序排列：测试台条目新增 ``seeds`` 与
+  ``runs``（每个 run 含 seed/status/reason/diagnostics/assertions/
+  coverage/simulate）；
+- 全部种子通过该台才 passed；某种子进程非零退出记 simulation_failed 并
+  停止该台后续种子；断言失败记 assertion_failed 但继续后续种子；正常
+  结束却缺断言或覆盖率统计记 incomplete_statistics；编译失败时 runs
+  为空、reason 为 compilation_failed；
+- 断言按名取跨种子终态并累加 fail_count；coverage 按名跨种子累加 hits
+  后再跨台合并（hit_testbenches 去重）。种子沿用 regress 的解析与校验，
+  且不可与逐测试台种子（``--tb-seed``）并用。
 
 校验规则（生成报告之前）：
 
@@ -20,12 +35,13 @@
 测试台失败、断言失败或覆盖率低于阈值时仍生成完整报告，总体 ``result``
 记为 ``failed``；只有全部检查通过且没有跳过必测项才记为 ``passed``。
 
-基线对比（``VerifyConfig.baseline_path``，schema v4）：先按原流程生成
-当前结果，再把当前报告与上次 ``verify`` 生成的基线报告按 name 对齐对比
-（testbenches、assertions、coverage），在 v3 字段之后追加
-``comparison``；有差异时总体 ``result`` 记为 ``failed``。基线不存在、
-不可读、非合法 JSON、不是 rtl-lab 验证报告或版本不受支持时抛
-:class:`InputError`，不执行仿真、不生成或覆盖报告。
+基线对比（``VerifyConfig.baseline_path``）：先按原流程生成当前结果，再把
+当前报告与上次 ``verify`` 生成的基线报告按 name 对齐对比
+（testbenches、assertions、coverage），在既有字段之后追加 ``comparison``；
+有差异时总体 ``result`` 记为 ``failed``。单种子报告基线版为 schema v4；
+多种子报告保持 schema v5（同样追加 ``comparison``）。基线不存在、不可读、
+非合法 JSON、不是 rtl-lab 验证报告或版本不受支持时抛 :class:`InputError`，
+不执行仿真、不生成或覆盖报告。
 """
 
 import hashlib
@@ -46,7 +62,7 @@ from .report import (
     ensure_report_writable,
     write_report,
 )
-from .runner import SOURCE_SUFFIXES, _prepare_and_compile  # noqa: PLC2701
+from .runner import SOURCE_SUFFIXES, _prepare_and_compile, parse_seeds  # noqa: PLC2701
 from .tools import run_simulation
 
 #: 测试台原因枚举（稳定取值，不依赖平台文本）。
@@ -162,9 +178,15 @@ class VerifyConfig:
     :param coverage: :class:`CoverageConfig`，缺省阈值 1.0。
     :param workdir: 工作目录（各测试台产物置于其下独立子目录）。
     :param report_path: JSON 报告输出路径，可为 None。
-    :param jobs: 并发编译/仿真的测试台数，默认 1（顺序执行）。
+    :param jobs: 并发编译/仿真的测试台数，默认 1（顺序执行）；并发只发生
+        在测试台之间，同一测试台的各种子始终串行。
     :param baseline_path: 上次 verify 生成的 JSON 报告路径，可为 None；
-        指定时生成带 ``comparison`` 的 schema v4 报告。
+        指定时生成带 ``comparison`` 的对比报告。
+    :param seeds: 多种子矩阵的非负整数种子列表（也接受逗号分隔字符串，
+        由 :func:`rtl_lab.runner.parse_seeds` 解析）；非空时每个未跳过
+        测试台编译一次、按列表顺序逐种子以 ``+SEED=<seed>`` 仿真，产出
+        schema v5 报告。与 :attr:`TestSpec.seed`（``--tb-seed``）语义
+        互斥：矩阵种子非空时各测试台不得另行指定种子。
     """
 
     sources: list
@@ -176,6 +198,7 @@ class VerifyConfig:
     report_path: str = None
     jobs: int = 1
     baseline_path: str = None
+    seeds: object = None
 
     def __post_init__(self):
         self.sources = list(self.sources)
@@ -191,6 +214,12 @@ class VerifyConfig:
             raise ValueError("jobs 必须是正整数")
         if self.jobs < 1:
             raise ValueError("jobs 必须是正整数")
+        # 多种子矩阵沿用 regress 的种子解析与校验（空值/负数/非整数/
+        # 重复均为 InputError）；None 表示传统单种子 verify。
+        if self.seeds is None:
+            self.seeds = []
+        else:
+            self.seeds = parse_seeds(self.seeds)
 
 
 def _validate(config):
@@ -236,6 +265,15 @@ def _validate(config):
         # 没有可执行测试台：不生成新报告（已有报告保留）。
         raise RuntimeError("没有可执行的测试台（所有测试台均被跳过）")
 
+    # 多种子矩阵与逐测试台种子（--tb-seed）互斥；CLI 在标志同时出现时
+    # 先行拒绝，这里再兜底拒绝非零的逐测试台种子，避免被静默忽略。
+    if config.seeds and any(
+        isinstance(t.seed, bool) or not isinstance(t.seed, int)
+        or t.seed != 0
+        for t in config.testbenches
+    ):
+        raise InputError("多种子矩阵（--seeds）不可与 --tb-seed 并用")
+
     if config.report_path:
         ensure_report_writable(config.report_path)
 
@@ -252,8 +290,24 @@ class _TbConfig:
         self.workdir = workdir
 
 
-def _execute_testbench(spec, config, amount, unit, run_token, tb_dir):
-    """编译并仿真单个测试台，返回归属到本次运行的结果 dict。"""
+def _simulate_once(vvp_output, tb_workdir, seed):
+    """执行一次仿真并解析结果，返回 (rc, collector, diagnostics, command)。"""
+    rc, sout, serr, run_command = run_simulation(
+        vvp_path=os.path.basename(vvp_output),
+        seed=seed, cwd=tb_workdir,
+    )
+    collector = ResultCollector()
+    collector.feed_text(sout)
+    diagnostics = []
+    if sout:
+        diagnostics.append(sout)
+    if serr:
+        diagnostics.append(serr)
+    return rc, collector, diagnostics, run_command
+
+
+def _run_single_seed(spec, config, amount, unit, run_token, tb_dir):
+    """传统单种子（schema v3）路径：编译一次、仿真一次。"""
     start_time = _now_iso()
 
     if spec.skip:
@@ -305,19 +359,13 @@ def _execute_testbench(spec, config, amount, unit, run_token, tb_dir):
             "assertions": {},
             "coverage": {},
             "commands": {"compile": compile_command, "simulate": []},
+            "_artifacts": (vvp_output, watchdog_path),
         }
 
-    rc, sout, serr, run_command = run_simulation(
-        vvp_path=os.path.basename(vvp_output),
-        seed=spec.seed, cwd=tb_workdir,
+    rc, collector, sim_diagnostics, run_command = _simulate_once(
+        vvp_output, tb_workdir, spec.seed
     )
-
-    collector = ResultCollector()
-    collector.feed_text(sout)
-    if sout:
-        diagnostics.append(sout)
-    if serr:
-        diagnostics.append(serr)
+    diagnostics.extend(sim_diagnostics)
 
     if rc != 0:
         status, reason = "failed", "simulation_failed"
@@ -348,8 +396,159 @@ def _execute_testbench(spec, config, amount, unit, run_token, tb_dir):
     }
 
 
+def _classify_seed_run(rc, collector):
+    """执行阶段单子种子结果的 (status, reason)；status ∈ passed/failed。
+
+    与 v3 逐台执行阶段保持同一裁决：仅“缺断言”在此判失败；“缺覆盖率”
+    属运行级两级裁决（见 :func:`verify`），此处先按 passed 保留。
+    """
+    if rc != 0:
+        return "failed", "simulation_failed"
+    if collector.has_failure:
+        return "failed", "assertion_failed"
+    if not collector.assertions:
+        return "failed", "incomplete_statistics"
+    return "passed", "passed"
+
+
+def _aggregate_matrix_tb(runs, *, hard_stop):
+    """由各 run 结果推导测试台级 (status, reason)。
+
+    仿真硬停止（某种子进程非零退出）固定 simulation_failed；否则
+    assertion_failed 优先于 incomplete_statistics；全部通过才 passed。
+    """
+    if hard_stop:
+        return "failed", "simulation_failed"
+    reasons = {r["reason"] for r in runs if r["status"] == "failed"}
+    if "assertion_failed" in reasons:
+        return "failed", "assertion_failed"
+    if "incomplete_statistics" in reasons:
+        return "failed", "incomplete_statistics"
+    return "passed", "passed"
+
+
+def _run_seed_matrix(spec, config, amount, unit, run_token, tb_dir):
+    """多种子矩阵（schema v5）路径：编译一次，同台种子按序串行仿真。
+
+    - 仿真进程非零退出：该 run 记 simulation_failed，停止该台后续种子；
+    - 断言失败：记 assertion_failed，但继续后续种子；
+    - 正常结束却缺少断言或覆盖率统计：记 incomplete_statistics，继续后续
+      种子（与断言失败同为可恢复的结果级失败）；
+    - 全部种子均通过，该台才为 passed。
+    """
+    start_time = _now_iso()
+    seeds = list(config.seeds)
+
+    if spec.skip:
+        return {
+            "run_token": run_token,
+            "name": spec.name,
+            "top": spec.top.strip(),
+            "testbench_file": spec.testbench,
+            "status": "skipped",
+            "reason": "skipped",
+            "required": spec.required,
+            "start_time": start_time,
+            "end_time": _now_iso(),
+            "diagnostics": [],
+            "commands": {"compile": [], "simulate": []},
+            "seeds": seeds,
+            "runs": [],
+        }
+
+    tb_workdir = os.path.abspath(os.path.join(config.workdir, tb_dir))
+    os.makedirs(tb_workdir, exist_ok=True)
+    tb_config = _TbConfig(
+        config.sources, spec.testbench, spec.top, tb_workdir
+    )
+
+    (vvp_output, watchdog_path,
+     rc, cout, cerr, compile_command) = _prepare_and_compile(
+        tb_config, amount, unit
+    )
+
+    tb_diagnostics = []
+    if cout:
+        tb_diagnostics.append(cout)
+    if cerr:
+        tb_diagnostics.append(cerr)
+
+    if rc != 0:
+        # 编译失败：不仿真，runs 为空。
+        return {
+            "run_token": run_token,
+            "name": spec.name,
+            "top": spec.top.strip(),
+            "testbench_file": spec.testbench,
+            "status": "failed",
+            "reason": "compilation_failed",
+            "required": spec.required,
+            "start_time": start_time,
+            "end_time": _now_iso(),
+            "diagnostics": tb_diagnostics,
+            "commands": {"compile": compile_command, "simulate": []},
+            "seeds": seeds,
+            "runs": [],
+            "_artifacts": (vvp_output, watchdog_path),
+        }
+
+    runs = []
+    hard_stop = False
+    for seed in seeds:
+        rc, collector, sim_diagnostics, run_command = _simulate_once(
+            vvp_output, tb_workdir, seed
+        )
+        run_status, run_reason = _classify_seed_run(rc, collector)
+        runs.append({
+            "seed": seed,
+            "status": run_status,
+            "reason": run_reason,
+            "diagnostics": sim_diagnostics,
+            "assertions": collector.assertions,
+            "coverage": collector.coverage,
+            "command": {"simulate": run_command},
+        })
+        # 仿真进程非零退出：停止该台后续种子（断言/统计类失败继续）。
+        if run_reason == "simulation_failed":
+            hard_stop = True
+            break
+
+    tb_status, tb_reason = _aggregate_matrix_tb(runs, hard_stop=hard_stop)
+
+    # 条目级 diagnostics 保留编译输出（各 run 的仿真输出在其 runs 内）；
+    # 条目级 simulate 命令取首个实际执行种子，作为该台代表 argv。
+    return {
+        "run_token": run_token,
+        "name": spec.name,
+        "top": spec.top.strip(),
+        "testbench_file": spec.testbench,
+        "status": tb_status,
+        "reason": tb_reason,
+        "required": spec.required,
+        "start_time": start_time,
+        "end_time": _now_iso(),
+        "diagnostics": tb_diagnostics,
+        "commands": {
+            "compile": compile_command,
+            "simulate": runs[0]["command"]["simulate"] if runs else [],
+        },
+        "seeds": seeds,
+        "runs": runs,
+        "_artifacts": (vvp_output, watchdog_path),
+    }
+
+
+def _execute_testbench(spec, config, amount, unit, run_token, tb_dir):
+    """编译并仿真单个测试台；按配置分派单种子或多种子矩阵路径。"""
+    if config.seeds:
+        return _run_seed_matrix(
+            spec, config, amount, unit, run_token, tb_dir
+        )
+    return _run_single_seed(spec, config, amount, unit, run_token, tb_dir)
+
+
 def verify(config=None, **kwargs):
-    """执行统一验证并生成 schema v3 报告。
+    """执行统一验证并生成报告（默认 schema v3；多种子矩阵为 schema v5）。
 
     可传 :class:`VerifyConfig`，也可用关键字参数直接构造。
 
@@ -357,8 +556,9 @@ def verify(config=None, **kwargs):
         断言失败或覆盖率不达标时不抛异常，报告 ``result`` 为 ``failed``。
     :raises ValueError: ``run_id`` 为空或覆盖率/jobs 配置非法。
     :raises OSError: 报告输出位置不可写。
-    :raises InputError: 源文件/测试台/时长等输入非法，或基线报告不存在、
-        不可读、非合法 JSON、非 rtl-lab 验证报告、版本不受支持。
+    :raises InputError: 源文件/测试台/时长/种子矩阵等输入非法，或
+        ``--seeds`` 与 ``--tb-seed`` 并用，或基线报告不存在、不可读、
+        非合法 JSON、非 rtl-lab 验证报告、版本不受支持。
     :raises RuntimeError: 结果归属错误、命名冲突、无可执行测试台或无任何
         覆盖率结果；这几种情况不覆盖已有报告。
     """
@@ -413,20 +613,46 @@ def verify(config=None, **kwargs):
     if not executed:
         raise RuntimeError("没有可执行的测试台结果")
 
-    # 覆盖率缺失的两级判定，各自有唯一可观察结果：
-    # - 运行级：所有测试台都正常结束且有断言，但整个运行没有任何覆盖率结果，
-    #   无法评估覆盖率 => RuntimeError，保留已有报告；
-    # - 测试台级：运行在别处确实收集到了覆盖率，而某个正常结束的测试台自身
-    #   没有任何覆盖率点 => 该台统计缺失，记为 failed。
-    # 编译/仿真/断言硬失败优先：即使全局无覆盖率也照常生成 failed 报告。
-    run_has_coverage = any(o["coverage"] for o in executed)
-    if run_has_coverage:
-        for o in executed:
-            if o["status"] == "passed" and not o["coverage"]:
-                o["status"] = "failed"
-                o["reason"] = "incomplete_statistics"
-    elif not any(o["status"] == "failed" for o in executed):
-        raise RuntimeError("没有任何覆盖率结果")
+    if config.seeds:
+        # 多种子矩阵：两级裁决下沉到 run 粒度。
+        run_has_coverage = any(
+            r["coverage"] for o in executed for r in o["runs"]
+        )
+        if run_has_coverage:
+            for o in executed:
+                changed = False
+                for r in o["runs"]:
+                    if r["status"] == "passed" and not r["coverage"]:
+                        # 运行在别处收集到了覆盖率，而该种子自身一个覆盖点
+                        # 都没有：正常结束却统计缺失，记为 failed。
+                        r["status"] = "failed"
+                        r["reason"] = "incomplete_statistics"
+                        changed = True
+                if changed:
+                    hard_stop = any(
+                        r["reason"] == "simulation_failed"
+                        for r in o["runs"]
+                    )
+                    o["status"], o["reason"] = _aggregate_matrix_tb(
+                        o["runs"], hard_stop=hard_stop
+                    )
+        elif not any(o["status"] == "failed" for o in executed):
+            raise RuntimeError("没有任何覆盖率结果")
+    else:
+        # 覆盖率缺失的两级判定，各自有唯一可观察结果：
+        # - 运行级：所有测试台都正常结束且有断言，但整个运行没有任何覆盖率结果，
+        #   无法评估覆盖率 => RuntimeError，保留已有报告；
+        # - 测试台级：运行在别处确实收集到了覆盖率，而某个正常结束的测试台自身
+        #   没有任何覆盖率点 => 该台统计缺失，记为 failed。
+        # 编译/仿真/断言硬失败优先：即使全局无覆盖率也照常生成 failed 报告。
+        run_has_coverage = any(o["coverage"] for o in executed)
+        if run_has_coverage:
+            for o in executed:
+                if o["status"] == "passed" and not o["coverage"]:
+                    o["status"] = "failed"
+                    o["reason"] = "incomplete_statistics"
+        elif not any(o["status"] == "failed" for o in executed):
+            raise RuntimeError("没有任何覆盖率结果")
 
     artifacts = []
     for o in outcomes:
@@ -453,12 +679,15 @@ def verify(config=None, **kwargs):
         generated_at=_now_iso(),
         workdir=config.workdir,
         known_paths=known_paths,
+        seeds=config.seeds,
     )
 
     if baseline is not None:
-        # 基线对比：v3 字段及顺序保持不变，comparison 追加在最后；
+        # 基线对比：既有字段及顺序保持不变，comparison 追加在最后；
         # 有差异时总体结论记为 failed（无论当前检查是否通过）。
-        data["schema_version"] = VERIFICATION_COMPARISON_SCHEMA_VERSION
+        # schema 版本沿用当前报告（v3 单种子 -> v4；v5 多种子仍为 v5）。
+        if not config.seeds:
+            data["schema_version"] = VERIFICATION_COMPARISON_SCHEMA_VERSION
         comparison = compare_verification_reports(
             data, baseline,
             baseline_path=config.baseline_path, workdir=config.workdir,

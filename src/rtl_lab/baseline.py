@@ -1,4 +1,4 @@
-"""验证报告的基线加载与结构化对比（schema v4）。
+"""验证报告的基线加载与结构化对比（schema v4；v5 报告同样可作基线）。
 
 ``verify --baseline PATH`` 把上次 ``verify`` 生成的 JSON 报告作为基线：
 先按原流程执行并生成当前结果（执行顺序、种子、产物目录与字段语义均不
@@ -25,14 +25,17 @@ from .errors import InputError
 from .report import (
     VERIFICATION_COMPARISON_SCHEMA_VERSION,
     VERIFICATION_FORMAT,
+    VERIFICATION_MULTISEED_SCHEMA_VERSION,
     VERIFICATION_SCHEMA_VERSION,
     sanitize_path,
 )
 
-#: 可作为基线读取的报告版本（v3 原始报告与 v4 带对比报告均可）。
+#: 可作为基线读取的报告版本（v3 原始报告、v4 带对比报告与 v5 多种子
+#: 报告均可）。
 SUPPORTED_BASELINE_SCHEMA_VERSIONS = (
     VERIFICATION_SCHEMA_VERSION,
     VERIFICATION_COMPARISON_SCHEMA_VERSION,
+    VERIFICATION_MULTISEED_SCHEMA_VERSION,
 )
 
 #: 各类别参与对比的字段；顺序即同名多个字段差异的稳定排列顺序。

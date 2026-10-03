@@ -102,11 +102,20 @@ def test_load_baseline_non_dict_json(tmp_path):
 
 def test_load_baseline_unsupported_version(tmp_path):
     report = _report()
-    report["schema_version"] = 5
+    report["schema_version"] = 99
     f = tmp_path / "base.json"
     f.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(InputError):
         load_baseline_report(str(f))
+
+
+def test_load_baseline_ok_v5(tmp_path):
+    report = _report()
+    report["schema_version"] = 5
+    report["seeds"] = [1, 2, 3]
+    f = tmp_path / "base.json"
+    f.write_text(json.dumps(report), encoding="utf-8")
+    assert load_baseline_report(str(f))["schema_version"] == 5
 
 
 # ---- compare_verification_reports ----
