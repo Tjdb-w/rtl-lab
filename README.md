@@ -13,7 +13,7 @@
 ```bash
 rtl-lab run design1.v [design2.v ...] \
     --tb tb.v --top tb --duration 100ns \
-    [--workdir DIR] [--seed N] [--report report.json]
+    [--workdir DIR] [--seed N] [--timeout SECONDS] [--report report.json]
 ```
 
 编译一次、以 `+SEED=<seed>` 执行一次仿真，生成 schema v1 报告。
@@ -24,7 +24,7 @@ rtl-lab run design1.v [design2.v ...] \
 rtl-lab regress design1.v [design2.v ...] \
     --tb tb.v --top tb --duration 100ns \
     --seeds 1,2,3 \
-    [--workdir DIR] [--report report.json]
+    [--workdir DIR] [--timeout SECONDS] [--report report.json]
 ```
 
 源文件、测试台、顶层、时长、工作目录与可选 `--report` 与 `run` 相同；
@@ -58,7 +58,7 @@ rtl-lab verify design1.v [design2.v ...] \
     --tb FILE[@TOP[@NAME]] ... [--cover NAME ...] \
     [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
     [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
-    [--workdir DIR] [--report report.json]
+    [--timeout SECONDS] [--workdir DIR] [--report report.json]
 ```
 
 每个测试台在工作目录下的独立子目录中独立编译、独立仿真；`--jobs N`
@@ -73,7 +73,8 @@ schema v3 报告；加 `--baseline PATH` 时与上次 verify 报告按 name 对�
 rtl-lab verify design1.v [design2.v ...] \
     --run-id ID --duration 100ns \
     --tb FILE[@TOP[@NAME]] ... --seeds 1,2,3 \
-    [--jobs N] [--baseline PATH] [--workdir DIR] [--report report.json]
+    [--jobs N] [--baseline PATH] [--timeout SECONDS] \
+    [--workdir DIR] [--report report.json]
 ```
 
 `--seeds` 与 regress 语义一致：逗号分隔的非负十进制整数（允许前导零、
@@ -99,6 +100,27 @@ rtl-lab verify design1.v [design2.v ...] \
 测试台失败、断言失败、覆盖率未达标、跳过必测项或基线差异任一成立，
 总体 `result` 即为 `failed`，否则 `passed`。`--seeds --baseline` 仍为
 schema v5（`comparison` 追加在最后）；v3/v4/v5 报告均可作为基线。
+
+### 进程超时
+
+`run`、`regress`、`verify` 均接受可选 `--timeout SECONDS`（Python
+入口为配置对象的 `timeout` 字段）：每次独立启动的 `iverilog` 与
+`vvp` 进程的墙钟超时秒数，从进程启动计到自然结束，不以仿真时长代替。
+只接受正十进制整数；零、负数、小数、非数字或空值均为输入错误
+（退出 2，不生成或覆盖报告）。省略时保持不限制。
+
+- `run` 的编译与仿真分别计时；`regress` 编译计时一次、每种子的仿真
+  分别计时；`verify` 各测试台编译与各种子仿真独立计时，`--jobs`
+  只并行测试台，不合并也不平均各调用预算；
+- 达到上限时终止该进程及其残留子进程，保留已捕获的 stdout，并向该
+  阶段 stderr 追加稳定标记 `RTL_LAB_PROCESS_TIMEOUT`（诊断中同样
+  出现，不依赖平台超时提示文本）；
+- 超时归入既有阶段失败，不新增报告版本：编译超时等价编译失败
+  （`compile_failed` / `compilation_failed`，run/regress 退出 3，
+  多种子矩阵 runs 为空），仿真超时等价仿真失败
+  （`simulation_failed`，run/regress 退出 5，回归保留此前种子结果
+  后停止，多种子矩阵停止该台后续种子），verify 总体结论 failed、
+  退出 7。
 
 Python 入口：
 

@@ -54,10 +54,12 @@ class RunConfig:
     :param workdir: 工作目录（编译产物与临时文件置于其中）。
     :param seed: 随机种子（非负整数）。
     :param report_path: JSON 报告输出路径，可为 None。
+    :param timeout: 每次 iverilog/vvp 调用的墙钟超时秒数（正十进制整数），
+        None 表示不限制；编译与仿真分别计时。
     """
 
     def __init__(self, *, sources, testbench, top, duration,
-                 workdir=".", seed=0, report_path=None):
+                 workdir=".", seed=0, report_path=None, timeout=None):
         self.sources = list(sources)
         self.testbench = testbench
         self.top = top
@@ -65,6 +67,7 @@ class RunConfig:
         self.workdir = workdir
         self.seed = seed
         self.report_path = report_path
+        self.timeout = timeout
 
 
 class RegressConfig:
@@ -74,10 +77,12 @@ class RegressConfig:
 
     :param seeds: 非负整数种子列表（按顺序依次执行，不可为空或含重复项）；
         也接受逗号分隔字符串，由 :func:`parse_seeds` 统一解析。
+    :param timeout: 每次 iverilog/vvp 调用的墙钟超时秒数（正十进制整数），
+        None 表示不限制；编译计时一次，各种子仿真分别计时。
     """
 
     def __init__(self, *, sources, testbench, top, duration, seeds,
-                 workdir=".", report_path=None):
+                 workdir=".", report_path=None, timeout=None):
         self.sources = list(sources)
         self.testbench = testbench
         self.top = top
@@ -85,6 +90,34 @@ class RegressConfig:
         self.seeds = list(seeds) if not isinstance(seeds, str) else seeds
         self.workdir = workdir
         self.report_path = report_path
+        self.timeout = timeout
+
+
+def normalize_timeout(value):
+    """规范化 ``--timeout``：正十进制整数秒，None 表示不限制。
+
+    零、负数、小数、非数字、空值或布尔值均抛 :class:`InputError`
+    （退出码 2，不生成报告）。接受 ``int`` 或纯十进制数字符串
+    （允许前导零），其余类型一律拒绝。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise InputError(f"超时时间必须为正整数秒，收到 {value!r}")
+    if isinstance(value, int):
+        seconds = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise InputError("超时时间不能为空")
+        if not text.isdigit():
+            raise InputError(f"超时时间必须为正整数秒，收到 {value!r}")
+        seconds = int(text)
+    else:
+        raise InputError(f"超时时间必须为正整数秒，收到 {value!r}")
+    if seconds <= 0:
+        raise InputError(f"超时时间必须为正整数秒，收到 {value!r}")
+    return seconds
 
 
 def parse_seeds(value):
@@ -157,6 +190,7 @@ def _validate(config):
         raise InputError(f"随机种子必须为非负整数，收到 {config.seed!r}")
     if config.seed < 0:
         raise InputError(f"随机种子不能为负数，收到 {config.seed}")
+    config.timeout = normalize_timeout(config.timeout)
 
     return _validate_common(
         sources=config.sources, testbench=config.testbench,
@@ -166,6 +200,7 @@ def _validate(config):
 
 def _validate_regress(config):
     """校验回归配置：通用字段 + 种子列表。"""
+    config.timeout = normalize_timeout(config.timeout)
     amount, unit = _validate_common(
         sources=config.sources, testbench=config.testbench,
         top=config.top, duration=config.duration,
@@ -223,6 +258,7 @@ def _prepare_and_compile(config, amount, unit):
         top=config.top.strip(),
         output_path=vvp_output,
         extra_roots=[WATCHDOG_MODULE],
+        timeout=config.timeout,
     )
     return vvp_output, watchdog_path, rc, cout, cerr, compile_command
 
@@ -272,7 +308,7 @@ def run(config=None, **kwargs):
     # vvp 以工作目录为 cwd 运行，故产物使用 basename 定位。
     rc, sout, serr, run_command = run_simulation(
         vvp_path=os.path.basename(vvp_output),
-        seed=config.seed, cwd=config.workdir
+        seed=config.seed, cwd=config.workdir, timeout=config.timeout,
     )
 
     collector = ResultCollector()
@@ -416,7 +452,7 @@ def regress(config=None, **kwargs):
     for seed in config.seeds:
         rc, sout, serr, run_command = run_simulation(
             vvp_path=os.path.basename(vvp_output),
-            seed=seed, cwd=config.workdir,
+            seed=seed, cwd=config.workdir, timeout=config.timeout,
         )
         stdout_parts.append(sout)
         stderr_parts.append(serr)

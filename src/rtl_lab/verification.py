@@ -62,7 +62,12 @@ from .report import (
     ensure_report_writable,
     write_report,
 )
-from .runner import SOURCE_SUFFIXES, _prepare_and_compile, parse_seeds  # noqa: PLC2701
+from .runner import (  # noqa: PLC2701
+    SOURCE_SUFFIXES,
+    _prepare_and_compile,
+    normalize_timeout,
+    parse_seeds,
+)
 from .tools import run_simulation
 
 #: 测试台原因枚举（稳定取值，不依赖平台文本）。
@@ -187,6 +192,9 @@ class VerifyConfig:
         测试台编译一次、按列表顺序逐种子以 ``+SEED=<seed>`` 仿真，产出
         schema v5 报告。与 :attr:`TestSpec.seed`（``--tb-seed``）语义
         互斥：矩阵种子非空时各测试台不得另行指定种子。
+    :param timeout: 每次 iverilog/vvp 调用的墙钟超时秒数（正十进制整数），
+        None 表示不限制；各测试台编译与各种子仿真分别独立计时，
+        ``--jobs`` 并发不合并也不平均各调用预算。
     """
 
     sources: list
@@ -199,6 +207,7 @@ class VerifyConfig:
     jobs: int = 1
     baseline_path: str = None
     seeds: object = None
+    timeout: object = None
 
     def __post_init__(self):
         self.sources = list(self.sources)
@@ -220,6 +229,8 @@ class VerifyConfig:
             self.seeds = []
         else:
             self.seeds = parse_seeds(self.seeds)
+        # 超时校验属于输入错误（InputError，退出码 2，不生成报告）。
+        self.timeout = normalize_timeout(self.timeout)
 
 
 def _validate(config):
@@ -283,18 +294,19 @@ def _validate(config):
 class _TbConfig:
     """复用 runner 编译逻辑所需的最小配置视图。"""
 
-    def __init__(self, sources, testbench, top, workdir):
+    def __init__(self, sources, testbench, top, workdir, timeout=None):
         self.sources = sources
         self.testbench = testbench
         self.top = top
         self.workdir = workdir
+        self.timeout = timeout
 
 
-def _simulate_once(vvp_output, tb_workdir, seed):
+def _simulate_once(vvp_output, tb_workdir, seed, timeout=None):
     """执行一次仿真并解析结果，返回 (rc, collector, diagnostics, command)。"""
     rc, sout, serr, run_command = run_simulation(
         vvp_path=os.path.basename(vvp_output),
-        seed=seed, cwd=tb_workdir,
+        seed=seed, cwd=tb_workdir, timeout=timeout,
     )
     collector = ResultCollector()
     collector.feed_text(sout)
@@ -330,7 +342,8 @@ def _run_single_seed(spec, config, amount, unit, run_token, tb_dir):
     tb_workdir = os.path.abspath(os.path.join(config.workdir, tb_dir))
     os.makedirs(tb_workdir, exist_ok=True)
     tb_config = _TbConfig(
-        config.sources, spec.testbench, spec.top, tb_workdir
+        config.sources, spec.testbench, spec.top, tb_workdir,
+        timeout=config.timeout,
     )
 
     (vvp_output, watchdog_path,
@@ -363,7 +376,7 @@ def _run_single_seed(spec, config, amount, unit, run_token, tb_dir):
         }
 
     rc, collector, sim_diagnostics, run_command = _simulate_once(
-        vvp_output, tb_workdir, spec.seed
+        vvp_output, tb_workdir, spec.seed, timeout=config.timeout
     )
     diagnostics.extend(sim_diagnostics)
 
@@ -459,7 +472,8 @@ def _run_seed_matrix(spec, config, amount, unit, run_token, tb_dir):
     tb_workdir = os.path.abspath(os.path.join(config.workdir, tb_dir))
     os.makedirs(tb_workdir, exist_ok=True)
     tb_config = _TbConfig(
-        config.sources, spec.testbench, spec.top, tb_workdir
+        config.sources, spec.testbench, spec.top, tb_workdir,
+        timeout=config.timeout,
     )
 
     (vvp_output, watchdog_path,
@@ -496,7 +510,7 @@ def _run_seed_matrix(spec, config, amount, unit, run_token, tb_dir):
     hard_stop = False
     for seed in seeds:
         rc, collector, sim_diagnostics, run_command = _simulate_once(
-            vvp_output, tb_workdir, seed
+            vvp_output, tb_workdir, seed, timeout=config.timeout
         )
         run_status, run_reason = _classify_seed_run(rc, collector)
         runs.append({
