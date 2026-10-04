@@ -14,7 +14,8 @@
 rtl-lab run design1.v [design2.v ...] \
     --tb tb.v --top tb --duration 100ns \
     [--workdir DIR] [--seed N] [--timeout SECONDS] [--report report.json] \
-    [--incdir DIR ...] [--define NAME[=VALUE] ...]
+    [--incdir DIR ...] [--define NAME[=VALUE] ...] \
+    [--parameter PATH=VALUE ...]
 ```
 
 编译一次、以 `+SEED=<seed>` 执行一次仿真，生成 schema v1 报告。
@@ -26,7 +27,8 @@ rtl-lab regress design1.v [design2.v ...] \
     --tb tb.v --top tb --duration 100ns \
     --seeds 1,2,3 \
     [--workdir DIR] [--timeout SECONDS] [--report report.json] \
-    [--incdir DIR ...] [--define NAME[=VALUE] ...]
+    [--incdir DIR ...] [--define NAME[=VALUE] ...] \
+    [--parameter PATH=VALUE ...]
 ```
 
 源文件、测试台、顶层、时长、工作目录与可选 `--report` 与 `run` 相同；
@@ -93,6 +95,28 @@ iverilog 前一次性校验：`--incdir` 为空、路径不存在或不是目录
 字段、schema 版本与退出码不变；include 文件缺失或宏导致编译错误时
 沿用既有编译失败结果。
 
+### 设计参数覆盖
+
+三个命令均可重复给出 `--parameter PATH=VALUE`（Python 入口为配置对象
+的 `parameters` 列表，按输入顺序保存）：`PATH` 是从所选顶层开始的
+参数层级名（如 `top.U_DUT.WIDTH`），编译时按给出顺序把每项转换为
+iverilog 的 `-P` 参数，随源文件、顶层、测试台与看门狗一起用于每次
+编译。`run` 编译一次，`regress` 编译一次后复用于全部种子，`verify`
+仍按测试台独立编译（所有测试台共享同一组参数覆盖）。省略时编译命令
+与既有行为完全一致。
+
+`PATH` 只能由 ASCII 字母、数字、下划线和点组成，首字符与末字符不能
+是点，不能出现连续点，每一层不能以数字开头；同一次执行中 `PATH` 不
+得重复。`VALUE` 可为空并可含等号与空白，但不得包含换行、回车或 NUL。
+输入在启动 iverilog 前一次性校验：空 `PATH`、非法 `PATH`、重复
+`PATH` 或 `VALUE` 含换行/回车/NUL 均为输入错误（退出 2，不生成或
+覆盖报告）；参数无法被设计接受或导致预处理、elaboration 失败时沿用
+既有编译失败结果（退出 3，生成 `compile_failed` 报告）。
+
+参数覆盖只出现在实际编译命令及报告记录中（沿用既有路径脱敏），报告
+字段、字段顺序、schema 版本与退出码不变；相同输入顺序、工作目录与
+工具环境下参数顺序与报告内容可复现（仅 `generated_at` 可变化）。
+
 ### 统一验证
 
 ```bash
@@ -102,7 +126,8 @@ rtl-lab verify design1.v [design2.v ...] \
     [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
     [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
     [--timeout SECONDS] [--workdir DIR] [--report report.json] \
-    [--incdir DIR ...] [--define NAME[=VALUE] ...]
+    [--incdir DIR ...] [--define NAME[=VALUE] ...] \
+    [--parameter PATH=VALUE ...]
 ```
 
 每个测试台在工作目录下的独立子目录中独立编译、独立仿真；`--jobs N`

@@ -206,6 +206,9 @@ class VerifyConfig:
         iverilog ``-I``，所有测试台共享）；省略时不传任何 include 参数。
     :param defines: 预处理宏定义列表（``NAME`` 或 ``NAME=VALUE``
         字符串，按给出顺序传给 iverilog ``-D``）；省略时不定义任何宏。
+    :param parameters: 设计参数覆盖列表（``PATH=VALUE`` 字符串，PATH 为
+        从所选顶层开始的参数层级名，按给出顺序传给 iverilog ``-P``，
+        所有测试台共享）；省略时不覆盖任何参数。
     """
 
     sources: list
@@ -221,6 +224,7 @@ class VerifyConfig:
     timeout: object = None
     include_dirs: list = field(default_factory=list)
     defines: list = field(default_factory=list)
+    parameters: list = field(default_factory=list)
 
     def __post_init__(self):
         self.sources = list(self.sources)
@@ -230,6 +234,7 @@ class VerifyConfig:
         ]
         self.include_dirs = list(self.include_dirs or [])
         self.defines = list(self.defines or [])
+        self.parameters = list(self.parameters or [])
         if self.coverage is None:
             self.coverage = CoverageConfig()
         elif not isinstance(self.coverage, CoverageConfig):
@@ -256,7 +261,7 @@ def _validate(config):
 
     amount, unit, _fs = normalize_duration(config.duration)
 
-    # include 目录与宏定义与 run/regress 共用同一套校验规则。
+    # include 目录、宏定义与参数覆盖与 run/regress 共用同一套校验规则。
     validate_compile_options(config)
 
     if not config.sources:
@@ -314,7 +319,7 @@ class _TbConfig:
     """复用 runner 编译逻辑所需的最小配置视图。"""
 
     def __init__(self, sources, testbench, top, workdir, timeout=None,
-                 include_dirs=(), defines=()):
+                 include_dirs=(), defines=(), parameters=()):
         self.sources = sources
         self.testbench = testbench
         self.top = top
@@ -322,6 +327,7 @@ class _TbConfig:
         self.timeout = timeout
         self.include_dirs = include_dirs
         self.defines = defines
+        self.parameters = parameters
 
 
 def _simulate_once(vvp_output, tb_workdir, seed, timeout=None):
@@ -367,6 +373,7 @@ def _run_single_seed(spec, config, amount, unit, run_token, tb_dir):
         config.sources, spec.testbench, spec.top, tb_workdir,
         timeout=config.timeout,
         include_dirs=config.include_dirs, defines=config.defines,
+        parameters=config.parameters,
     )
 
     (vvp_output, watchdog_path,
@@ -498,6 +505,7 @@ def _run_seed_matrix(spec, config, amount, unit, run_token, tb_dir):
         config.sources, spec.testbench, spec.top, tb_workdir,
         timeout=config.timeout,
         include_dirs=config.include_dirs, defines=config.defines,
+        parameters=config.parameters,
     )
 
     (vvp_output, watchdog_path,
