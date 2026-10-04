@@ -86,13 +86,17 @@ def _execute(cmd, *, tool_name, cwd=None, timeout=None):
 
 
 def compile_sources(*, source_files, top, output_path, extra_roots=(),
-                    timeout=None):
+                    include_dirs=(), defines=(), timeout=None):
     """按给定顺序调用 iverilog 编译并以顶层模块做 elaboration。
 
     :param source_files: 设计源文件 + 测试台（已校验顺序的路径列表）。
     :param top: 顶层模块名（``-s`` 根模块）。
     :param output_path: 编译产物（.vvp）路径。
     :param extra_roots: 额外的根模块（如看门狗）。
+    :param include_dirs: include 搜索目录列表，按给出顺序转换为
+        ``-I <dir>`` 参数。
+    :param defines: 宏定义列表（``NAME`` 或 ``NAME=VALUE``），按给出顺序
+        转换为 ``-D <name>[=<value>]`` 参数。
     :param timeout: 本次编译进程的墙钟超时（正整数秒），None 表示不限制。
     :returns: ``(returncode, stdout, stderr, command)``。
     :raises ToolError: iverilog 无法启动。
@@ -101,6 +105,10 @@ def compile_sources(*, source_files, top, output_path, extra_roots=(),
     cmd = [iverilog, "-g2012", "-o", output_path, "-s", top]
     for root in extra_roots:
         cmd += ["-s", root]
+    for incdir in include_dirs:
+        cmd += ["-I", incdir]
+    for define in defines:
+        cmd += ["-D", define]
     cmd += list(source_files)
 
     rc, stdout, stderr = _execute(cmd, tool_name="iverilog", timeout=timeout)

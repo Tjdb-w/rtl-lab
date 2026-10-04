@@ -70,6 +70,7 @@ from .report import (
 from .runner import (  # noqa: PLC2701
     SOURCE_SUFFIXES,
     _prepare_and_compile,
+    parse_compile_flags,
     parse_seeds,
     parse_timeout,
 )
@@ -201,6 +202,10 @@ class VerifyConfig:
         也接受十进制字符串，由 :func:`rtl_lab.runner.parse_timeout`
         解析）；None 表示不限制。每个测试台独立编译、每个种子独立仿真，
         各次进程调用分别计时，不合并或平均预算。
+    :param include_dirs: include 搜索目录列表（可选，按给出顺序转换为
+        ``-I`` 参数；相对路径按启动时的当前目录解析）。
+    :param defines: 宏定义列表（可选，``NAME`` 或 ``NAME=VALUE``，
+        按给出顺序转换为 ``-D`` 参数）。
     """
 
     sources: list
@@ -214,6 +219,8 @@ class VerifyConfig:
     baseline_path: str = None
     seeds: object = None
     timeout: object = None
+    include_dirs: list = field(default_factory=list)
+    defines: list = field(default_factory=list)
 
     def __post_init__(self):
         self.sources = list(self.sources)
@@ -221,6 +228,8 @@ class VerifyConfig:
             t if isinstance(t, TestSpec) else TestSpec(**t)
             for t in self.testbenches
         ]
+        self.include_dirs = list(self.include_dirs or [])
+        self.defines = list(self.defines or [])
         if self.coverage is None:
             self.coverage = CoverageConfig()
         elif not isinstance(self.coverage, CoverageConfig):
@@ -260,6 +269,11 @@ def _validate(config):
 
     for source in config.sources:
         check_file(source, "设计源文件")
+
+    # include 目录与宏定义与源文件同属编译输入，一次性校验。
+    config.include_dirs, config.defines = parse_compile_flags(
+        config.include_dirs, config.defines
+    )
 
     if not config.testbenches:
         raise InputError("至少需要一个测试台")
@@ -301,12 +315,15 @@ def _validate(config):
 class _TbConfig:
     """复用 runner 编译逻辑所需的最小配置视图。"""
 
-    def __init__(self, sources, testbench, top, workdir, timeout=None):
+    def __init__(self, sources, testbench, top, workdir, timeout=None,
+                 include_dirs=(), defines=()):
         self.sources = sources
         self.testbench = testbench
         self.top = top
         self.workdir = workdir
         self.timeout = timeout
+        self.include_dirs = include_dirs
+        self.defines = defines
 
 
 def _simulate_once(vvp_output, tb_workdir, seed, timeout=None):
@@ -351,6 +368,7 @@ def _run_single_seed(spec, config, amount, unit, run_token, tb_dir):
     tb_config = _TbConfig(
         config.sources, spec.testbench, spec.top, tb_workdir,
         timeout=config.timeout,
+        include_dirs=config.include_dirs, defines=config.defines,
     )
 
     (vvp_output, watchdog_path,
@@ -481,6 +499,7 @@ def _run_seed_matrix(spec, config, amount, unit, run_token, tb_dir):
     tb_config = _TbConfig(
         config.sources, spec.testbench, spec.top, tb_workdir,
         timeout=config.timeout,
+        include_dirs=config.include_dirs, defines=config.defines,
     )
 
     (vvp_output, watchdog_path,

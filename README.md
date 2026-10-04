@@ -14,6 +14,7 @@
 rtl-lab run design1.v [design2.v ...] \
     --tb tb.v --top tb --duration 100ns \
     [--workdir DIR] [--seed N] [--timeout SECONDS] [--report report.json]
+    [--incdir DIR ...] [--define NAME[=VALUE] ...]
 ```
 
 编译一次、以 `+SEED=<seed>` 执行一次仿真，生成 schema v1 报告。
@@ -25,6 +26,7 @@ rtl-lab regress design1.v [design2.v ...] \
     --tb tb.v --top tb --duration 100ns \
     --seeds 1,2,3 \
     [--workdir DIR] [--timeout SECONDS] [--report report.json]
+    [--incdir DIR ...] [--define NAME[=VALUE] ...]
 ```
 
 源文件、测试台、顶层、时长、工作目录与可选 `--report` 与 `run` 相同；
@@ -71,6 +73,25 @@ report = regress(RegressConfig(
 退出 5；`verify` 当前种子 `simulation_failed` 并停止该台后续种子，
 `regress` 保留此前种子结果后停止）。
 
+### 编译选项：include 目录与宏定义
+
+三个命令均可重复指定 `--incdir DIR` 与 `--define NAME[=VALUE]`
+（Python 入口为配置对象的 `include_dirs` 与 `defines`，省略时编译
+命令与既有行为完全一致）。编译时按给出顺序把每个目录转换为 iverilog
+`-I` 参数、每个定义转换为 `-D` 参数，随源文件、顶层、测试台与看门狗
+一起用于每次编译：`run` 编译一次，`regress` 编译一次后复用于全部
+种子，`verify` 仍按测试台独立编译。相对目录按启动命令时的当前目录
+解析；参数原样记录于报告中的编译命令，沿用既有路径脱敏。
+
+输入在启动 iverilog 前一次性校验：`--incdir` 为空、路径不存在或不是
+目录，`--define` 为空、名称非法（NAME 只能由 ASCII 字母、数字和下
+划线组成且首字符不能是数字）或同一 NAME 重复给出，均为输入错误
+（退出 2，不生成或覆盖报告）。VALUE 可为空（空值宏仍按已定义处理）
+并可含等号；目录与定义都不能含换行、回车或 NUL。include 目录下找
+不到被包含文件或宏导致编译错误时，沿用既有编译失败结果（`run`/
+`regress` 退出 3 并生成 compile_failed 报告；`verify` 该测试台
+`compilation_failed`，多种子时 `runs` 为空）。
+
 ### 统一验证
 
 ```bash
@@ -80,6 +101,7 @@ rtl-lab verify design1.v [design2.v ...] \
     [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
     [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
     [--timeout SECONDS] [--workdir DIR] [--report report.json]
+    [--incdir DIR ...] [--define NAME[=VALUE] ...]
 ```
 
 每个测试台在工作目录下的独立子目录中独立编译、独立仿真；`--jobs N`

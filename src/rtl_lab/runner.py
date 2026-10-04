@@ -21,6 +21,7 @@
 """
 
 import os
+import re
 
 from .duration import normalize_duration
 from .errors import (
@@ -59,12 +60,17 @@ class RunConfig:
     :param workdir: 工作目录（编译产物与临时文件置于其中）。
     :param seed: 随机种子（非负整数）。
     :param report_path: JSON 报告输出路径，可为 None。
+    :param include_dirs: include 搜索目录列表（可选，按给出顺序转换为
+        ``-I`` 参数；相对路径按启动时的当前目录解析）。
+    :param defines: 宏定义列表（可选，``NAME`` 或 ``NAME=VALUE``，
+        按给出顺序转换为 ``-D`` 参数）。
     :param timeout: 每次 iverilog/vvp 进程调用的墙钟超时（正整数秒），
         None 表示不限制。
     """
 
     def __init__(self, *, sources, testbench, top, duration,
-                 workdir=".", seed=0, report_path=None, timeout=None):
+                 workdir=".", seed=0, report_path=None, include_dirs=None,
+                 defines=None, timeout=None):
         self.sources = list(sources)
         self.testbench = testbench
         self.top = top
@@ -72,6 +78,8 @@ class RunConfig:
         self.workdir = workdir
         self.seed = seed
         self.report_path = report_path
+        self.include_dirs = list(include_dirs) if include_dirs else []
+        self.defines = list(defines) if defines else []
         self.timeout = timeout
 
 
@@ -85,7 +93,8 @@ class RegressConfig:
     """
 
     def __init__(self, *, sources, testbench, top, duration, seeds,
-                 workdir=".", report_path=None, timeout=None):
+                 workdir=".", report_path=None, include_dirs=None,
+                 defines=None, timeout=None):
         self.sources = list(sources)
         self.testbench = testbench
         self.top = top
@@ -93,6 +102,8 @@ class RegressConfig:
         self.seeds = list(seeds) if not isinstance(seeds, str) else seeds
         self.workdir = workdir
         self.report_path = report_path
+        self.include_dirs = list(include_dirs) if include_dirs else []
+        self.defines = list(defines) if defines else []
         self.timeout = timeout
 
 
@@ -162,6 +173,54 @@ def parse_timeout(value):
     return timeout
 
 
+#: 宏名：ASCII 字母/数字/下划线，首字符不能是数字。
+_DEFINE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: 目录与宏定义中禁止出现的字符（会破坏命令行与报告的稳定记录）。
+_FORBIDDEN_FLAG_CHARS = ("\n", "\r", "\0")
+
+
+def parse_compile_flags(include_dirs, defines):
+    """校验并规范化 include 目录与宏定义，返回 ``(include_dirs, defines)``。
+
+    - 目录：不能为空，不能含换行/回车/NUL，必须存在且为目录；相对路径按
+      启动时的当前目录解析（原样保留，不做绝对化）。
+    - 宏定义：``NAME`` 或 ``NAME=VALUE``；NAME 只能由 ASCII 字母、数字和
+      下划线组成且首字符不能是数字；VALUE 可为空并可含等号（按首个 ``=``
+      切分）；同一 NAME 不可重复；空值宏仍按已定义处理。
+
+    任何非法输入抛 :class:`InputError`（退出码 2，不生成报告）。
+    """
+    dirs = []
+    for item in include_dirs or []:
+        if not isinstance(item, str) or not item.strip():
+            raise InputError("include 目录不能为空")
+        if any(ch in item for ch in _FORBIDDEN_FLAG_CHARS):
+            raise InputError(f"include 目录含非法字符：{item!r}")
+        if not os.path.exists(item):
+            raise InputError(f"include 目录不存在：{item}")
+        if not os.path.isdir(item):
+            raise InputError(f"include 路径不是目录：{item}")
+        dirs.append(item)
+
+    defs = []
+    seen = set()
+    for item in defines or []:
+        if not isinstance(item, str) or not item:
+            raise InputError("宏定义不能为空")
+        if any(ch in item for ch in _FORBIDDEN_FLAG_CHARS):
+            raise InputError(f"宏定义含非法字符：{item!r}")
+        name, _sep, _value = item.partition("=")
+        if not _DEFINE_NAME_RE.match(name):
+            raise InputError(f"宏定义名称非法：{item!r}")
+        if name in seen:
+            raise InputError(f"宏定义重复：{name}")
+        seen.add(name)
+        defs.append(item)
+
+    return dirs, defs
+
+
 def _validate_common(*, sources, testbench, top, duration):
     """校验源文件、测试台、顶层名与时长，返回规范化 ``(amount, unit)``。"""
     if not isinstance(top, str) or not top.strip():
@@ -195,6 +254,9 @@ def _validate(config):
     if config.seed < 0:
         raise InputError(f"随机种子不能为负数，收到 {config.seed}")
     config.timeout = parse_timeout(config.timeout)
+    config.include_dirs, config.defines = parse_compile_flags(
+        config.include_dirs, config.defines
+    )
 
     return _validate_common(
         sources=config.sources, testbench=config.testbench,
@@ -205,6 +267,9 @@ def _validate(config):
 def _validate_regress(config):
     """校验回归配置：通用字段 + 种子列表。"""
     config.timeout = parse_timeout(config.timeout)
+    config.include_dirs, config.defines = parse_compile_flags(
+        config.include_dirs, config.defines
+    )
     amount, unit = _validate_common(
         sources=config.sources, testbench=config.testbench,
         top=config.top, duration=config.duration,
@@ -262,6 +327,8 @@ def _prepare_and_compile(config, amount, unit):
         top=config.top.strip(),
         output_path=vvp_output,
         extra_roots=[WATCHDOG_MODULE],
+        include_dirs=config.include_dirs,
+        defines=config.defines,
         timeout=config.timeout,
     )
     return vvp_output, watchdog_path, rc, cout, cerr, compile_command
