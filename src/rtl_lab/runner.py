@@ -9,7 +9,7 @@
 单次流程：
 
 1. 校验输入（源文件存在性与后缀、顶层名、时长、种子、超时、include
-   目录与宏定义）；
+   目录、宏定义与参数覆盖）；
 2. 按给定顺序编译设计源文件与测试台，以顶层模块为根，并注入仿真时长看门狗；
 3. 执行仿真，随机种子通过 ``+SEED=<seed>`` plusarg 传入测试台；
 4. 完整保留仿真 stdout/stderr，解析 ASSERT/COVER 记录；
@@ -67,11 +67,14 @@ class RunConfig:
         iverilog ``-I``）；省略时不传任何 include 参数。
     :param defines: 预处理宏定义列表（``NAME`` 或 ``NAME=VALUE``
         字符串，按给出顺序传给 iverilog ``-D``）；省略时不定义任何宏。
+    :param parameters: 设计参数覆盖列表（``PATH=VALUE`` 字符串，PATH 为
+        从所选顶层开始的参数层级名，按给出顺序传给 iverilog ``-P``）；
+        省略时不覆盖任何参数。
     """
 
     def __init__(self, *, sources, testbench, top, duration,
                  workdir=".", seed=0, report_path=None, timeout=None,
-                 include_dirs=(), defines=()):
+                 include_dirs=(), defines=(), parameters=()):
         self.sources = list(sources)
         self.testbench = testbench
         self.top = top
@@ -82,6 +85,7 @@ class RunConfig:
         self.timeout = timeout
         self.include_dirs = list(include_dirs) if include_dirs else []
         self.defines = list(defines) if defines else []
+        self.parameters = list(parameters) if parameters else []
 
 
 class RegressConfig:
@@ -92,12 +96,13 @@ class RegressConfig:
     :param seeds: 非负整数种子列表（按顺序依次执行，不可为空或含重复项）；
         也接受逗号分隔字符串，由 :func:`parse_seeds` 统一解析。
 
-    ``include_dirs`` 与 ``defines`` 含义同 :class:`RunConfig`。
+    ``include_dirs``、``defines`` 与 ``parameters`` 含义同
+    :class:`RunConfig`。
     """
 
     def __init__(self, *, sources, testbench, top, duration, seeds,
                  workdir=".", report_path=None, timeout=None,
-                 include_dirs=(), defines=()):
+                 include_dirs=(), defines=(), parameters=()):
         self.sources = list(sources)
         self.testbench = testbench
         self.top = top
@@ -108,6 +113,7 @@ class RegressConfig:
         self.timeout = timeout
         self.include_dirs = list(include_dirs) if include_dirs else []
         self.defines = list(defines) if defines else []
+        self.parameters = list(parameters) if parameters else []
 
 
 def parse_seeds(value):
@@ -179,6 +185,12 @@ def parse_timeout(value):
 #: 宏定义名称的合法形式：ASCII 字母/数字/下划线，首字符不能是数字。
 DEFINE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
+#: 参数覆盖路径的合法形式：点分层级，每层为 ASCII 字母/数字/下划线且
+#: 首字符不能是数字（隐含：非空、不含点以外的符号、无首尾点与连续点）。
+PARAMETER_PATH_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z"
+)
+
 #: 目录与宏定义中禁止出现的字符（换行、回车、NUL）。
 _FORBIDDEN_CHARS = ("\n", "\r", "\x00")
 
@@ -190,13 +202,18 @@ def _reject_forbidden_chars(text, label):
 
 
 def validate_compile_options(config):
-    """校验并规范化 ``include_dirs`` 与 ``defines``（启动 iverilog 之前）。
+    """校验并规范化 ``include_dirs``、``defines`` 与 ``parameters``
+    （启动 iverilog 之前）。
 
     - include 目录：非空字符串、不含换行/回车/NUL，且必须已存在并为目录；
       相对路径保持原样，由 iverilog 按进程当前目录解析；
     - 宏定义：``NAME`` 或 ``NAME=VALUE``；NAME 限 ASCII 字母/数字/下划线
       且首字符非数字，同一 NAME 不可重复；VALUE 可为空并可含等号
-      （空值仍按已定义处理）。
+      （空值仍按已定义处理）；
+    - 参数覆盖：``PATH=VALUE``；PATH 为点分层级名，每层限 ASCII
+      字母/数字/下划线且首字符非数字（不得为空、无首尾点与连续点），
+      同一次执行中 PATH 不可重复；VALUE 可为空、可含等号与空白，但不得
+      包含换行、回车或 NUL。
 
     非法输入抛 :class:`InputError`；合法时把规范化列表写回 config。
     """
@@ -225,8 +242,25 @@ def validate_compile_options(config):
         seen_names.add(name)
         defines.append(item)
 
+    parameters = []
+    seen_paths = set()
+    for item in config.parameters or []:
+        if not isinstance(item, str) or not item:
+            raise InputError("参数覆盖不能为空")
+        if "=" not in item:
+            raise InputError(f"参数覆盖格式应为 PATH=VALUE：{item!r}")
+        path, _eq, value = item.partition("=")
+        if not PARAMETER_PATH_RE.match(path):
+            raise InputError(f"参数路径非法：{path!r}")
+        if path in seen_paths:
+            raise InputError(f"参数路径重复：{path}")
+        seen_paths.add(path)
+        _reject_forbidden_chars(value, "参数值")
+        parameters.append(item)
+
     config.include_dirs = include_dirs
     config.defines = defines
+    config.parameters = parameters
 
 
 def _validate_common(*, sources, testbench, top, duration):
@@ -333,6 +367,7 @@ def _prepare_and_compile(config, amount, unit):
         extra_roots=[WATCHDOG_MODULE],
         include_dirs=config.include_dirs,
         defines=config.defines,
+        parameters=config.parameters,
         timeout=config.timeout,
     )
     return vvp_output, watchdog_path, rc, cout, cerr, compile_command

@@ -5,11 +5,13 @@
     rtl-lab run --tb TB.v --top top_module --duration 100ns \
         [--workdir DIR] [--seed N] [--timeout SECONDS] [--report report.json] \
         [--incdir DIR ...] [--define NAME[=VALUE] ...] \
+        [--parameter PATH=VALUE ...] \
         design1.v [design2.v ...]
 
     rtl-lab regress --tb TB.v --top top_module --duration 100ns \
         --seeds 1,2,3 [--workdir DIR] [--timeout SECONDS] \
         [--incdir DIR ...] [--define NAME[=VALUE] ...] \
+        [--parameter PATH=VALUE ...] \
         [--report report.json] design1.v [design2.v ...]
 
     rtl-lab verify --run-id ID --duration 100ns \
@@ -18,11 +20,16 @@
         [--tb-seed NAME=SEED ...] [--seeds INT,INT,...] \
         [--jobs N] [--baseline PATH] [--timeout SECONDS] \
         [--incdir DIR ...] [--define NAME[=VALUE] ...] \
+        [--parameter PATH=VALUE ...] \
         [--workdir DIR] [--report report.json] \
         design1.v [design2.v ...]
 
 ``--incdir`` 与 ``--define`` 可重复给出，按顺序转换为 iverilog 的
 ``-I``/``-D`` 参数并随每次编译生效；省略时编译命令与既有行为一致。
+
+``--parameter`` 可重复给出，按顺序转换为 iverilog 的 ``-P`` 参数并随
+每次编译生效；``PATH`` 为从所选顶层开始的参数层级名（如
+``top.U_DUT.WIDTH``），``VALUE`` 可为空并可含等号。
 
 退出码：
 
@@ -95,6 +102,14 @@ def _add_common_args(p, *, with_seed):
         metavar="NAME[=VALUE]",
         help="预处理宏定义，可重复；NAME 限 ASCII 字母/数字/下划线且首字符"
              "不能是数字，VALUE 可为空并可含等号；同一 NAME 不可重复",
+    )
+    p.add_argument(
+        "--parameter", dest="parameters", action="append", default=[],
+        metavar="PATH=VALUE",
+        help="设计参数覆盖，可重复；PATH 为从所选顶层开始的点分层级名"
+             "（每层限 ASCII 字母/数字/下划线且首字符不能是数字，同一 "
+             "PATH 不可重复），VALUE 可为空并可含等号；按给出顺序以 -P "
+             "传给 iverilog",
     )
     p.add_argument(
         "--timeout", dest="timeout", default=None, metavar="SECONDS",
@@ -208,6 +223,14 @@ def _add_verify_args(p):
              "不能是数字，VALUE 可为空并可含等号；同一 NAME 不可重复",
     )
     p.add_argument(
+        "--parameter", dest="parameters", action="append", default=[],
+        metavar="PATH=VALUE",
+        help="设计参数覆盖，可重复；PATH 为从所选顶层开始的点分层级名"
+             "（每层限 ASCII 字母/数字/下划线且首字符不能是数字，同一 "
+             "PATH 不可重复），VALUE 可为空并可含等号；按给出顺序以 -P "
+             "传给 iverilog",
+    )
+    p.add_argument(
         "--timeout", dest="timeout", default=None, metavar="SECONDS",
         help="每次 iverilog/vvp 进程调用的墙钟超时（正十进制整数秒）；"
              "超时终止该进程并归入对应阶段失败，省略则不限制",
@@ -282,6 +305,7 @@ def _build_verify_config(args):
         timeout=args.timeout,
         include_dirs=args.include_dirs,
         defines=args.defines,
+        parameters=args.parameters,
     )
 
 
@@ -359,6 +383,7 @@ def main(argv=None):
                 timeout=args.timeout,
                 include_dirs=args.include_dirs,
                 defines=args.defines,
+                parameters=args.parameters,
             )
             report = run(config)
         elif args.command == "regress":
@@ -374,6 +399,7 @@ def main(argv=None):
                 timeout=args.timeout,
                 include_dirs=args.include_dirs,
                 defines=args.defines,
+                parameters=args.parameters,
             )
             report = regress(config)
         else:
