@@ -4,10 +4,12 @@
 
     rtl-lab run --tb TB.v --top top_module --duration 100ns \
         [--workdir DIR] [--seed N] [--timeout SECONDS] [--report report.json] \
+        [--incdir DIR ...] [--define NAME[=VALUE] ...] \
         design1.v [design2.v ...]
 
     rtl-lab regress --tb TB.v --top top_module --duration 100ns \
         --seeds 1,2,3 [--workdir DIR] [--timeout SECONDS] \
+        [--incdir DIR ...] [--define NAME[=VALUE] ...] \
         [--report report.json] design1.v [design2.v ...]
 
     rtl-lab verify --run-id ID --duration 100ns \
@@ -15,8 +17,12 @@
         [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
         [--tb-seed NAME=SEED ...] [--seeds INT,INT,...] \
         [--jobs N] [--baseline PATH] [--timeout SECONDS] \
+        [--incdir DIR ...] [--define NAME[=VALUE] ...] \
         [--workdir DIR] [--report report.json] \
         design1.v [design2.v ...]
+
+``--incdir`` 与 ``--define`` 可重复给出，按顺序转换为 iverilog 的
+``-I``/``-D`` 参数并随每次编译生效；省略时编译命令与既有行为一致。
 
 退出码：
 
@@ -77,6 +83,18 @@ def _add_common_args(p, *, with_seed):
     p.add_argument(
         "--report", dest="report", default=None, metavar="PATH",
         help="JSON 报告输出路径",
+    )
+    p.add_argument(
+        "--incdir", dest="include_dirs", action="append", default=[],
+        metavar="DIR",
+        help="include 文件搜索目录，可重复；按给出顺序以 -I 传给 "
+             "iverilog，相对路径按当前目录解析",
+    )
+    p.add_argument(
+        "--define", dest="defines", action="append", default=[],
+        metavar="NAME[=VALUE]",
+        help="预处理宏定义，可重复；NAME 限 ASCII 字母/数字/下划线且首字符"
+             "不能是数字，VALUE 可为空并可含等号；同一 NAME 不可重复",
     )
     p.add_argument(
         "--timeout", dest="timeout", default=None, metavar="SECONDS",
@@ -178,6 +196,18 @@ def _add_verify_args(p):
         help="JSON 报告输出路径",
     )
     p.add_argument(
+        "--incdir", dest="include_dirs", action="append", default=[],
+        metavar="DIR",
+        help="include 文件搜索目录，可重复；按给出顺序以 -I 传给 "
+             "iverilog，相对路径按当前目录解析",
+    )
+    p.add_argument(
+        "--define", dest="defines", action="append", default=[],
+        metavar="NAME[=VALUE]",
+        help="预处理宏定义，可重复；NAME 限 ASCII 字母/数字/下划线且首字符"
+             "不能是数字，VALUE 可为空并可含等号；同一 NAME 不可重复",
+    )
+    p.add_argument(
         "--timeout", dest="timeout", default=None, metavar="SECONDS",
         help="每次 iverilog/vvp 进程调用的墙钟超时（正十进制整数秒）；"
              "超时终止该进程并归入对应阶段失败，省略则不限制",
@@ -250,6 +280,8 @@ def _build_verify_config(args):
         baseline_path=args.baseline,
         seeds=matrix_seeds,
         timeout=args.timeout,
+        include_dirs=args.include_dirs,
+        defines=args.defines,
     )
 
 
@@ -325,6 +357,8 @@ def main(argv=None):
                 seed=args.seed,
                 report_path=args.report,
                 timeout=args.timeout,
+                include_dirs=args.include_dirs,
+                defines=args.defines,
             )
             report = run(config)
         elif args.command == "regress":
@@ -338,6 +372,8 @@ def main(argv=None):
                 workdir=args.workdir,
                 report_path=args.report,
                 timeout=args.timeout,
+                include_dirs=args.include_dirs,
+                defines=args.defines,
             )
             report = regress(config)
         else:
