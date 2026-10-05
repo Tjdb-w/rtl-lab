@@ -169,6 +169,53 @@ rtl-lab verify design1.v [design2.v ...] \
 总体 `result` 即为 `failed`，否则 `passed`。`--seeds --baseline` 仍为
 schema v5（`comparison` 追加在最后）；v3/v4/v5 报告均可作为基线。
 
+### 清单验证
+
+```bash
+rtl-lab verify --manifest manifest.json [--report report.json] [--baseline PATH]
+```
+
+`--manifest` 从 JSON 清单读取 verify 的全部配置，与逐项参数等价；给出后
+除 `--report`、`--baseline` 外的配置性逐项参数不可并用，冲突为输入错误
+（退出 2）。清单是 UTF-8 JSON 对象，`schema_version` 固定为 1：
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "nightly-01",
+  "duration": "100ns",
+  "sources": ["rtl/design1.v", "rtl/design2.v"],
+  "testbenches": [
+    {"testbench": "tb/tb_pass.v"},
+    {"testbench": "tb/tb_slow.v", "top": "tb_slow", "name": "slow",
+     "required": false, "skip": false, "seed": 7}
+  ],
+  "coverage": {"threshold": 0.9, "points": ["c1", "c2"]},
+  "compile": {"include_dirs": ["include"], "defines": ["WIDTH=8"],
+              "parameters": ["top.U_DUT.DEPTH=16"]},
+  "seeds": [1, 2, 3],
+  "jobs": 4,
+  "timeout": 60,
+  "workdir": "build/verify"
+}
+```
+
+- 必填：`run_id`、`duration`、`sources`（有序路径数组）、`testbenches`
+  （有序对象数组，每项以 `testbench` 指定文件，可选 `top`、`name`、
+  `required`、`skip`、`seed`）、`coverage`（含 `threshold`、`points`）；
+  可选：`compile`（含 `include_dirs`、`defines`、`parameters`）、
+  `seeds`、`jobs`、`timeout`、`workdir`；
+- 清单内的相对路径按清单所在目录解析，与启动目录无关；数组顺序即配置
+  顺序；报告与基线路径仍按启动目录解析；
+- 顶层 `seeds` 非空时启用多种子矩阵（schema v5），仍不可与测试台
+  `seed` 并用；
+- 清单不存在/不可读、不是 JSON 对象、`schema_version` 不为 1 或含未知
+  键时为输入错误（退出 2，不生成或覆盖报告）；其余字段校验、执行、
+  报告与退出码语义与逐项参数完全一致。
+
+Python 入口：`load_verify_manifest(path)` 只构造等价的 `VerifyConfig`
+（不执行编译或仿真），可直接传给 `verify()`。
+
 Python 入口：
 
 ```python

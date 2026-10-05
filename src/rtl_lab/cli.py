@@ -24,6 +24,13 @@
         [--workdir DIR] [--report report.json] \
         design1.v [design2.v ...]
 
+    rtl-lab verify --manifest manifest.json [--report report.json] \
+        [--baseline PATH]
+
+``--manifest`` 从 JSON 清单读取 verify 的全部配置（等价于逐项参数，
+清单内相对路径按清单目录解析）；给出后除 ``--report``、``--baseline``
+外的配置性逐项参数不可并用，冲突按输入错误处理（退出码 2）。
+
 ``--incdir`` 与 ``--define`` 可重复给出，按顺序转换为 iverilog 的
 ``-I``/``-D`` 参数并随每次编译生效；省略时编译命令与既有行为一致。
 
@@ -50,6 +57,7 @@ import os
 import sys
 
 from .errors import InputError, RTLLabError
+from .manifest import load_verify_manifest
 from .runner import RegressConfig, RunConfig, parse_seeds, regress, run
 from .verification import CoverageConfig, TestSpec, VerifyConfig, verify
 
@@ -142,33 +150,43 @@ def _build_parser():
 
 
 def _add_verify_args(p):
-    """添加 verify 子命令参数（sources 共用，测试台可多个）。"""
+    """添加 verify 子命令参数（sources 共用，测试台可多个）。
+
+    逐项参数在给出 ``--manifest`` 时全部不可并用（``--report`` 与
+    ``--baseline`` 除外）；标量参数默认 None 以便区分“未给出”。
+    """
     p.add_argument(
-        "sources", nargs="+", metavar="SOURCE",
+        "sources", nargs="*", metavar="SOURCE",
         help="设计源文件（.v/.sv），所有测试台共享，按给定顺序编译",
     )
     p.add_argument(
-        "--run-id", dest="run_id", required=True, metavar="ID",
+        "--manifest", dest="manifest", default=None, metavar="PATH",
+        help="verify 清单（JSON，schema_version=1）路径；从清单读取全部 "
+             "配置，清单内相对路径按清单目录解析；给出后除 --report、"
+             "--baseline 外的逐项参数不可并用",
+    )
+    p.add_argument(
+        "--run-id", dest="run_id", default=None, metavar="ID",
         help="运行标识，不能为空；用于结果归属与追溯",
     )
     p.add_argument(
-        "--duration", "--time", dest="duration", required=True,
+        "--duration", "--time", dest="duration", default=None,
         metavar="DURATION",
         help="仿真时长，正整数加单位：fs/ps/ns/us/ms/s，如 100ns",
     )
     p.add_argument(
         "--tb", "--testbench", dest="testbenches", action="append",
-        required=True, metavar="FILE[@TOP[@NAME]]",
+        default=[], metavar="FILE[@TOP[@NAME]]",
         help="测试台，可重复指定以选择多个；格式 文件[@顶层[@名称]]，"
              "省略顶层/名称时取文件 basename",
     )
     p.add_argument(
-        "--workdir", dest="workdir", default=".", metavar="DIR",
+        "--workdir", dest="workdir", default=None, metavar="DIR",
         help="工作目录（各测试台产物置于其下独立子目录，默认当前目录）",
     )
     p.add_argument(
         "--coverage-threshold", dest="coverage_threshold", type=float,
-        default=1.0, metavar="RATIO",
+        default=None, metavar="RATIO",
         help="覆盖率达标阈值 0~1，命中覆盖率点/总点（默认 1.0）",
     )
     p.add_argument(
@@ -198,7 +216,7 @@ def _add_verify_args(p):
              "+SEED=<seed> 仿真，产出 schema v5 报告；不可与 --tb-seed 并用",
     )
     p.add_argument(
-        "--jobs", dest="jobs", type=int, default=1, metavar="N",
+        "--jobs", dest="jobs", type=int, default=None, metavar="N",
         help="并发执行测试台的数量（默认 1，结果始终按选择顺序收集）",
     )
     p.add_argument(
@@ -252,6 +270,59 @@ def _parse_tb_spec(spec):
     return path, top, name
 
 
+def _require_verify_args(args, parser):
+    """无清单时保持逐项参数的必填校验（缺失即 usage 错误，退出 2）。"""
+    missing = []
+    if not args.sources:
+        missing.append("SOURCE")
+    if args.run_id is None:
+        missing.append("--run-id")
+    if args.duration is None:
+        missing.append("--duration")
+    if not args.testbenches:
+        missing.append("--tb")
+    if missing:
+        parser.error(
+            "the following arguments are required: " + ", ".join(missing)
+        )
+
+
+def _build_verify_config_from_manifest(args):
+    """从 ``--manifest`` 清单构造 :class:`VerifyConfig` 并叠加报告/基线。"""
+    conflicts = []
+    if args.sources:
+        conflicts.append("SOURCE")
+    for flag, given in (
+        ("--run-id", args.run_id is not None),
+        ("--duration", args.duration is not None),
+        ("--tb", bool(args.testbenches)),
+        ("--workdir", args.workdir is not None),
+        ("--coverage-threshold", args.coverage_threshold is not None),
+        ("--cover", bool(args.cover_points)),
+        ("--skip", bool(args.skip)),
+        ("--optional", bool(args.optional)),
+        ("--tb-seed", bool(args.tb_seeds)),
+        ("--seeds", args.seeds is not None),
+        ("--jobs", args.jobs is not None),
+        ("--incdir", bool(args.include_dirs)),
+        ("--define", bool(args.defines)),
+        ("--parameter", bool(args.parameters)),
+        ("--timeout", args.timeout is not None),
+    ):
+        if given:
+            conflicts.append(flag)
+    if conflicts:
+        raise InputError(
+            "--manifest 不可与配置性逐项参数并用：" + "、".join(conflicts)
+        )
+
+    config = load_verify_manifest(args.manifest)
+    # 报告与基线不属于清单内容，按启动目录解析。
+    config.report_path = args.report
+    config.baseline_path = args.baseline
+    return config
+
+
 def _build_verify_config(args):
     """把 verify 命令行参数组装为 :class:`VerifyConfig`。"""
     skip = set(args.skip)
@@ -286,7 +357,11 @@ def _build_verify_config(args):
 
     try:
         coverage = CoverageConfig(
-            threshold=args.coverage_threshold, points=args.cover_points
+            threshold=(
+                args.coverage_threshold
+                if args.coverage_threshold is not None else 1.0
+            ),
+            points=args.cover_points,
         )
     except ValueError as exc:
         raise InputError(str(exc)) from exc
@@ -297,9 +372,9 @@ def _build_verify_config(args):
         run_id=args.run_id,
         duration=args.duration,
         coverage=coverage,
-        workdir=args.workdir,
+        workdir=args.workdir if args.workdir is not None else ".",
         report_path=args.report,
-        jobs=args.jobs,
+        jobs=args.jobs if args.jobs is not None else 1,
         baseline_path=args.baseline,
         seeds=matrix_seeds,
         timeout=args.timeout,
@@ -403,7 +478,11 @@ def main(argv=None):
             )
             report = regress(config)
         else:
-            config = _build_verify_config(args)
+            if args.manifest is not None:
+                config = _build_verify_config_from_manifest(args)
+            else:
+                _require_verify_args(args, parser)
+                config = _build_verify_config(args)
             report = verify(config)
     except RTLLabError as exc:
         # 控制台展示诊断信息，但不替代 JSON 报告。

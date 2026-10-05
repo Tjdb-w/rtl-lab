@@ -6,6 +6,8 @@
 - :func:`regress`：多随机种子回归（编译一次，多种子依次仿真）；
 - :func:`verify`：多测试台统一验证，产出可复现的 schema v3 报告；
   给定多种子矩阵（``VerifyConfig(seeds=...)``）时产出 schema v5 报告；
+- :func:`load_verify_manifest`：从 JSON 清单（schema_version=1）构造
+  等价的 :class:`VerifyConfig`，对应 ``verify --manifest PATH``；
 - 配置类 :class:`RunConfig` / :class:`RegressConfig` /
   :class:`VerifyConfig`、:class:`TestSpec`、:class:`CoverageConfig`；
 - 异常类型 :class:`RTLLabError` 及其子类；
@@ -22,6 +24,7 @@ from .errors import (
     ToolError,
     SimulationError,
 )
+from .manifest import MANIFEST_SCHEMA_VERSION, load_verify_manifest
 from .report import (
     SCHEMA_VERSION,
     VERIFICATION_MULTISEED_SCHEMA_VERSION,
@@ -34,6 +37,7 @@ __all__ = [
     "run",
     "regress",
     "verify",
+    "load_verify_manifest",
     "RunConfig",
     "RegressConfig",
     "VerifyConfig",
@@ -47,4 +51,5 @@ __all__ = [
     "SCHEMA_VERSION",
     "VERIFICATION_SCHEMA_VERSION",
     "VERIFICATION_MULTISEED_SCHEMA_VERSION",
+    "MANIFEST_SCHEMA_VERSION",
 ]
