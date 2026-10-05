@@ -136,6 +136,59 @@ schema v3 报告；加 `--baseline PATH` 时与上次 verify 报告按 name 对�
 （testbenches/assertions/coverage 的既有字段）并追加 `comparison`，
 为 schema v4，有差异则结论 failed。
 
+### 清单驱动的统一验证
+
+```bash
+rtl-lab verify --manifest manifest.json \
+    [--report report.json] [--baseline PATH]
+```
+
+`--manifest` 从 JSON 清单读取 verify 的全部配置，与逐项参数走完全相同
+的执行、断言与覆盖率解析、基线比较和 JSON 报告路径（报告字段、顺序、
+脱敏、退出码与摘要均不变）。清单为普通 UTF-8 JSON 对象，
+`schema_version` 固定为 1：
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "nightly-01",
+  "duration": "100ns",
+  "sources": ["rtl/design1.v", "rtl/design2.v"],
+  "testbenches": [
+    {"testbench": "tb/tb_pass.v", "top": "tb_pass", "name": "tb_pass"},
+    {"testbench": "tb/tb_opt.v", "required": false, "seed": 7}
+  ],
+  "coverage": {"threshold": 0.9, "points": ["c1", "c2"]},
+  "compile": {
+    "include_dirs": ["include"],
+    "defines": ["WIDTH=8"],
+    "parameters": ["top.U_DUT.WIDTH=8"]
+  },
+  "seeds": [1, 2, 3],
+  "jobs": 2,
+  "timeout": 60,
+  "workdir": "build/verify"
+}
+```
+
+- 必填：`run_id`、`duration`、`sources`、`testbenches`、`coverage`；
+  可选：`compile`、`seeds`、`jobs`、`timeout`、`workdir`；
+- `sources` 为有序路径数组；`testbenches` 为有序对象数组，每项以
+  `testbench` 指定文件，可选 `top`、`name`、`required`、`skip`、
+  `seed`；`coverage` 含 `threshold`、`points`；`compile` 含
+  `include_dirs`、`defines`、`parameters`；
+- 清单内相对路径（sources、testbench、include_dirs、workdir）以清单
+  所在目录解析，与启动目录无关；数组顺序即配置顺序；
+- 顶层 `seeds` 非空时启用多种子矩阵（schema v5），仍禁止与测试台
+  `seed` 同时生效；
+- `--manifest` 与配置性逐项参数互斥，仅 `--report`、`--baseline`
+  可并用（按启动目录解析）；冲突退出 2；
+- 清单不可读、非普通 UTF-8 JSON 对象、`schema_version` 非 1 或含未知
+  键时退出 2，不生成或覆盖报告；其余字段校验与逐项参数一致。
+
+Python 入口：`rtl_lab.load_verify_manifest(path)` 只构造等价的
+`VerifyConfig`，不执行编译或仿真。
+
 ### 多种子矩阵验证
 
 ```bash

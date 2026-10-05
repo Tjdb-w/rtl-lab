@@ -24,6 +24,16 @@
         [--workdir DIR] [--report report.json] \
         design1.v [design2.v ...]
 
+    rtl-lab verify --manifest manifest.json \
+        [--report report.json] [--baseline PATH]
+
+``--manifest`` 从 JSON 清单（schema_version 1）读取 verify 的全部配置
+（run_id、duration、sources、testbenches、coverage 必填；compile、
+seeds、jobs、timeout、workdir 可选），清单内相对路径以清单目录解析；
+与配置性逐项参数互斥，仅 ``--report``、``--baseline`` 可并用（按启动
+目录解析）。清单非法（不可读、非 UTF-8 JSON 对象、schema_version 非 1、
+含未知键）时退出 2，不生成或覆盖报告。
+
 ``--incdir`` 与 ``--define`` 可重复给出，按顺序转换为 iverilog 的
 ``-I``/``-D`` 参数并随每次编译生效；省略时编译命令与既有行为一致。
 
@@ -50,6 +60,7 @@ import os
 import sys
 
 from .errors import InputError, RTLLabError
+from .manifest import load_verify_manifest
 from .runner import RegressConfig, RunConfig, parse_seeds, regress, run
 from .verification import CoverageConfig, TestSpec, VerifyConfig, verify
 
@@ -138,55 +149,68 @@ def _build_parser():
         help="多测试台统一验证（可多种子矩阵）并生成验证报告",
     )
     _add_verify_args(p_verify)
+    # 供 main 在未给 --manifest 时按 argparse 原有方式报缺失参数（退出 2）。
+    parser.verify_subparser = p_verify
     return parser
 
 
 def _add_verify_args(p):
-    """添加 verify 子命令参数（sources 共用，测试台可多个）。"""
+    """添加 verify 子命令参数（sources 共用，测试台可多个）。
+
+    除 ``--report``/``--baseline``/``--manifest`` 外，各配置性参数默认
+    均为 None，以便在给出 ``--manifest`` 时检测互斥冲突；未给清单时由
+    :func:`_build_verify_config` 落回既有默认值。
+    """
     p.add_argument(
-        "sources", nargs="+", metavar="SOURCE",
+        "sources", nargs="*", metavar="SOURCE",
         help="设计源文件（.v/.sv），所有测试台共享，按给定顺序编译",
     )
     p.add_argument(
-        "--run-id", dest="run_id", required=True, metavar="ID",
+        "--manifest", dest="manifest", default=None, metavar="PATH",
+        help="验证清单（JSON，schema_version 1）；提供 run_id、duration、"
+             "sources、testbenches、coverage 等全部配置，相对路径以清单"
+             "目录解析；与逐项配置参数互斥，仅 --report、--baseline 可并用",
+    )
+    p.add_argument(
+        "--run-id", dest="run_id", default=None, metavar="ID",
         help="运行标识，不能为空；用于结果归属与追溯",
     )
     p.add_argument(
-        "--duration", "--time", dest="duration", required=True,
+        "--duration", "--time", dest="duration", default=None,
         metavar="DURATION",
         help="仿真时长，正整数加单位：fs/ps/ns/us/ms/s，如 100ns",
     )
     p.add_argument(
         "--tb", "--testbench", dest="testbenches", action="append",
-        required=True, metavar="FILE[@TOP[@NAME]]",
+        default=None, metavar="FILE[@TOP[@NAME]]",
         help="测试台，可重复指定以选择多个；格式 文件[@顶层[@名称]]，"
              "省略顶层/名称时取文件 basename",
     )
     p.add_argument(
-        "--workdir", dest="workdir", default=".", metavar="DIR",
+        "--workdir", dest="workdir", default=None, metavar="DIR",
         help="工作目录（各测试台产物置于其下独立子目录，默认当前目录）",
     )
     p.add_argument(
         "--coverage-threshold", dest="coverage_threshold", type=float,
-        default=1.0, metavar="RATIO",
+        default=None, metavar="RATIO",
         help="覆盖率达标阈值 0~1，命中覆盖率点/总点（默认 1.0）",
     )
     p.add_argument(
-        "--cover", dest="cover_points", action="append", default=[],
+        "--cover", dest="cover_points", action="append", default=None,
         metavar="NAME",
         help="显式要求的覆盖率点名，可重复；点名但无统计记为 unavailable",
     )
     p.add_argument(
-        "--skip", dest="skip", action="append", default=[], metavar="NAME",
+        "--skip", dest="skip", action="append", default=None, metavar="NAME",
         help="跳过指定测试台名，可重复；跳过的必测项会使结论 failed",
     )
     p.add_argument(
-        "--optional", dest="optional", action="append", default=[],
+        "--optional", dest="optional", action="append", default=None,
         metavar="NAME",
         help="把指定测试台名标记为非必测，可重复；跳过非必测不影响结论",
     )
     p.add_argument(
-        "--tb-seed", dest="tb_seeds", action="append", default=[],
+        "--tb-seed", dest="tb_seeds", action="append", default=None,
         metavar="NAME=SEED",
         help="为指定测试台名设置随机种子（默认 0），可重复；"
              "不可与 --seeds 并用",
@@ -198,7 +222,7 @@ def _add_verify_args(p):
              "+SEED=<seed> 仿真，产出 schema v5 报告；不可与 --tb-seed 并用",
     )
     p.add_argument(
-        "--jobs", dest="jobs", type=int, default=1, metavar="N",
+        "--jobs", dest="jobs", type=int, default=None, metavar="N",
         help="并发执行测试台的数量（默认 1，结果始终按选择顺序收集）",
     )
     p.add_argument(
@@ -211,19 +235,19 @@ def _add_verify_args(p):
         help="JSON 报告输出路径",
     )
     p.add_argument(
-        "--incdir", dest="include_dirs", action="append", default=[],
+        "--incdir", dest="include_dirs", action="append", default=None,
         metavar="DIR",
         help="include 文件搜索目录，可重复；按给出顺序以 -I 传给 "
              "iverilog，相对路径按当前目录解析",
     )
     p.add_argument(
-        "--define", dest="defines", action="append", default=[],
+        "--define", dest="defines", action="append", default=None,
         metavar="NAME[=VALUE]",
         help="预处理宏定义，可重复；NAME 限 ASCII 字母/数字/下划线且首字符"
              "不能是数字，VALUE 可为空并可含等号；同一 NAME 不可重复",
     )
     p.add_argument(
-        "--parameter", dest="parameters", action="append", default=[],
+        "--parameter", dest="parameters", action="append", default=None,
         metavar="PATH=VALUE",
         help="设计参数覆盖，可重复；PATH 为从所选顶层开始的点分层级名"
              "（每层限 ASCII 字母/数字/下划线且首字符不能是数字，同一 "
@@ -252,10 +276,73 @@ def _parse_tb_spec(spec):
     return path, top, name
 
 
+def _check_verify_required(args, subparser):
+    """未给 --manifest 时按 argparse 原有方式强制必填项（退出 2）。"""
+    if args.manifest is not None:
+        return
+    missing = []
+    if not args.sources:
+        missing.append("SOURCE")
+    if args.run_id is None:
+        missing.append("--run-id")
+    if args.duration is None:
+        missing.append("--duration/--time")
+    if not args.testbenches:
+        missing.append("--tb/--testbench")
+    if missing:
+        subparser.error(
+            "the following arguments are required: " + ", ".join(missing)
+        )
+
+
+def _build_manifest_verify_config(args):
+    """从 --manifest 清单构造 :class:`VerifyConfig`（仅 --report/--baseline 可并用）。"""
+    conflicts = []
+    if args.sources:
+        conflicts.append("SOURCE")
+    # 标量参数以 None 为“未给出”哨兵（0.0/空串等显式取值也算冲突）。
+    for flag, value in (
+        ("--run-id", args.run_id),
+        ("--duration/--time", args.duration),
+        ("--workdir", args.workdir),
+        ("--coverage-threshold", args.coverage_threshold),
+        ("--seeds", args.seeds),
+        ("--jobs", args.jobs),
+        ("--timeout", args.timeout),
+    ):
+        if value is not None:
+            conflicts.append(flag)
+    # 可重复参数未给出时为 None，给出后为非空列表。
+    for flag, value in (
+        ("--tb/--testbench", args.testbenches),
+        ("--cover", args.cover_points),
+        ("--skip", args.skip),
+        ("--optional", args.optional),
+        ("--tb-seed", args.tb_seeds),
+        ("--incdir", args.include_dirs),
+        ("--define", args.defines),
+        ("--parameter", args.parameters),
+    ):
+        if value:
+            conflicts.append(flag)
+    if conflicts:
+        raise InputError(
+            "--manifest 不可与配置性逐项参数并用：" + "、".join(conflicts)
+        )
+    config = load_verify_manifest(args.manifest)
+    # 报告与基线不属于清单内容，按启动目录解析后并入配置。
+    config.report_path = args.report
+    config.baseline_path = args.baseline
+    return config
+
+
 def _build_verify_config(args):
     """把 verify 命令行参数组装为 :class:`VerifyConfig`。"""
-    skip = set(args.skip)
-    optional = set(args.optional)
+    if args.manifest is not None:
+        return _build_manifest_verify_config(args)
+
+    skip = set(args.skip or [])
+    optional = set(args.optional or [])
 
     # 多种子矩阵与逐测试台种子互斥；两者同时给出即输入错误（退出 2）。
     matrix_seeds = parse_seeds(args.seeds) if args.seeds is not None else None
@@ -263,7 +350,7 @@ def _build_verify_config(args):
         raise InputError("--seeds 不可与 --tb-seed 并用")
 
     seeds = {}
-    for item in args.tb_seeds:
+    for item in args.tb_seeds or []:
         if "=" not in item:
             raise InputError(f"--tb-seed 格式应为 NAME=SEED：{item!r}")
         tname, value = item.split("=", 1)
@@ -286,7 +373,11 @@ def _build_verify_config(args):
 
     try:
         coverage = CoverageConfig(
-            threshold=args.coverage_threshold, points=args.cover_points
+            threshold=(
+                args.coverage_threshold
+                if args.coverage_threshold is not None else 1.0
+            ),
+            points=args.cover_points or [],
         )
     except ValueError as exc:
         raise InputError(str(exc)) from exc
@@ -297,15 +388,15 @@ def _build_verify_config(args):
         run_id=args.run_id,
         duration=args.duration,
         coverage=coverage,
-        workdir=args.workdir,
+        workdir=args.workdir if args.workdir is not None else ".",
         report_path=args.report,
-        jobs=args.jobs,
+        jobs=args.jobs if args.jobs is not None else 1,
         baseline_path=args.baseline,
         seeds=matrix_seeds,
         timeout=args.timeout,
-        include_dirs=args.include_dirs,
-        defines=args.defines,
-        parameters=args.parameters,
+        include_dirs=args.include_dirs or [],
+        defines=args.defines or [],
+        parameters=args.parameters or [],
     )
 
 
@@ -369,6 +460,10 @@ def main(argv=None):
     """命令行入口，返回进程退出码。"""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "verify":
+        # 未给 --manifest 时，run_id/duration/tb/sources 仍为必填，
+        # 按 argparse 原有方式报错（退出 2）。
+        _check_verify_required(args, parser.verify_subparser)
 
     try:
         if args.command == "run":
