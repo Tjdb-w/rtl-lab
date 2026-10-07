@@ -47,11 +47,19 @@
 多种子报告保持 schema v5（同样追加 ``comparison``）。基线不存在、不可读、
 非合法 JSON、不是 rtl-lab 验证报告或版本不受支持时抛 :class:`InputError`，
 不执行仿真、不生成或覆盖报告。
+
+JUnit XML（``VerifyConfig.junit_path``）：JSON 报告生成后，若配置了
+``junit_path``，额外输出与报告同源、同脱敏的确定性 JUnit XML（构建规则
+见 :mod:`rtl_lab.junit`）。``junit_path`` 为空或与报告/基线路径为同一
+文件时抛 :class:`InputError`；JSON 与 XML 先各写临时文件再一起原子
+替换，任一写入失败都不生成或覆盖已有文件（:class:`OSError`，退出 8）。
 """
 
 import hashlib
+import json
 import os
 import re
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -59,13 +67,13 @@ from datetime import datetime, timezone
 from .baseline import compare_verification_reports, load_baseline_report
 from .duration import normalize_duration
 from .errors import InputError
+from .junit import build_junit_xml
 from .parser import ResultCollector
 from .report import (
     Report,
     VERIFICATION_COMPARISON_SCHEMA_VERSION,
     build_verification_report,
     ensure_report_writable,
-    write_report,
 )
 from .runner import (  # noqa: PLC2701
     SOURCE_SUFFIXES,
@@ -189,6 +197,10 @@ class VerifyConfig:
     :param coverage: :class:`CoverageConfig`，缺省阈值 1.0。
     :param workdir: 工作目录（各测试台产物置于其下独立子目录）。
     :param report_path: JSON 报告输出路径，可为 None。
+    :param junit_path: JUnit XML 输出路径，可为 None；非空时在 JSON 报告
+        生成后额外输出一份与报告同源、同脱敏的确定性 JUnit XML。为空、
+        与 ``report_path``/``baseline_path`` 指向同一文件均为输入错误；
+        输出位置不可写或写入失败按 verify 前置条件失败处理（退出 8）。
     :param jobs: 并发编译/仿真的测试台数，默认 1（顺序执行）；并发只发生
         在测试台之间，同一测试台的各种子始终串行。
     :param baseline_path: 上次 verify 生成的 JSON 报告路径，可为 None；
@@ -218,6 +230,7 @@ class VerifyConfig:
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
     workdir: str = "."
     report_path: str = None
+    junit_path: str = None
     jobs: int = 1
     baseline_path: str = None
     seeds: object = None
@@ -311,6 +324,21 @@ def _validate(config):
 
     if config.report_path:
         ensure_report_writable(config.report_path)
+
+    if config.junit_path is not None:
+        if not isinstance(config.junit_path, str) or not config.junit_path.strip():
+            raise InputError("JUnit XML 输出路径不能为空")
+        junit_abs = os.path.normcase(os.path.abspath(config.junit_path))
+        for other, label in (
+            (config.report_path, "JSON 报告"),
+            (config.baseline_path, "基线报告"),
+        ):
+            if other and junit_abs == os.path.normcase(os.path.abspath(other)):
+                raise InputError(
+                    f"JUnit XML 输出路径不能与 {label} 为同一文件："
+                    f"{config.junit_path!r}"
+                )
+        ensure_report_writable(config.junit_path)
 
     return amount, unit
 
@@ -593,6 +621,51 @@ def _execute_testbench(spec, config, amount, unit, run_token, tb_dir):
     return _run_single_seed(spec, config, amount, unit, run_token, tb_dir)
 
 
+def _dump_json_text(report):
+    """与 :func:`rtl_lab.report.write_report` 一致的 JSON 文本（含末尾换行）。"""
+    return json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+
+
+def write_verify_outputs(report, report_path, junit_path):
+    """原子地落盘 verify 的 JSON 报告与 JUnit XML。
+
+    两个目标各自先写到同目录临时文件，全部写完后再依次替换：任一输出
+    不可写或写入失败时抛 :class:`OSError`，已有 JSON/XML 均不被生成或
+    覆盖（前置可写性已在生成前校验，这里兜底写入期失败）。
+    """
+    targets = [
+        (report_path, _dump_json_text(report)),
+        (junit_path, build_junit_xml(report)),
+    ]
+    targets = [(path, text) for path, text in targets if path]
+    temps = []
+    try:
+        for path, text in targets:
+            parent = os.path.dirname(os.path.abspath(path))
+            os.makedirs(parent, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".rtl_lab_report_", dir=parent
+            )
+            temps.append((path, tmp_name))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except BaseException:
+                os.unlink(tmp_name)
+                raise
+        for path, tmp_name in temps:
+            os.replace(tmp_name, path)
+        temps = []
+    finally:
+        for _path, tmp_name in temps:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
 def verify(config=None, **kwargs):
     """执行统一验证并生成报告（默认 schema v3；多种子矩阵为 schema v5）。
 
@@ -601,10 +674,11 @@ def verify(config=None, **kwargs):
     :returns: 始终返回 :class:`Report`（含总体 ``result``）；测试台失败、
         断言失败或覆盖率不达标时不抛异常，报告 ``result`` 为 ``failed``。
     :raises ValueError: ``run_id`` 为空或覆盖率/jobs 配置非法。
-    :raises OSError: 报告输出位置不可写。
+    :raises OSError: 报告或 JUnit XML 输出位置不可写（含写入期失败）。
     :raises InputError: 源文件/测试台/时长/种子矩阵等输入非法，或
         ``--seeds`` 与 ``--tb-seed`` 并用，或基线报告不存在、不可读、
-        非合法 JSON、非 rtl-lab 验证报告、版本不受支持。
+        非合法 JSON、非 rtl-lab 验证报告、版本不受支持，或
+        ``junit_path`` 为空、与 JSON 报告/基线报告为同一文件。
     :raises RuntimeError: 结果归属错误、命名冲突、无可执行测试台或无任何
         覆盖率结果；这几种情况不覆盖已有报告。
     """
@@ -743,6 +817,11 @@ def verify(config=None, **kwargs):
             data["result"] = "failed"
 
     report = Report(data)
-    if config.report_path:
-        write_report(report, config.report_path)
+    if config.report_path or config.junit_path:
+        # JSON 与 XML 一起落盘：先各自写到同目录临时文件再原子替换，
+        # 任一输出写入失败时两个目标均不被生成或覆盖（按前置条件失败
+        # 处理，退出 8）。
+        write_verify_outputs(
+            report, config.report_path, config.junit_path
+        )
     return report

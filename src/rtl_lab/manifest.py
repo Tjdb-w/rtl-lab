@@ -173,9 +173,9 @@ def _build_compile(obj, base_dir):
 def load_verify_manifest(path):
     """加载 verify 清单并返回等价的 :class:`VerifyConfig`。
 
-    只构造配置，不执行编译或仿真；报告输出与基线路径不属于清单内容，
-    由调用方（CLI 的 ``--report`` / ``--baseline``，按启动目录解析）
-    在返回的配置上另行设置。
+    只构造配置，不执行编译或仿真；报告、基线与 JUnit XML 输出路径不
+    属于清单内容，由调用方（CLI 的 ``--report`` / ``--baseline`` /
+    ``--junit``，按启动目录解析）在返回的配置上另行设置。
 
     :param path: 清单文件路径（JSON 对象，``schema_version`` 为 1）。
     :raises InputError: 清单不可读、非普通 UTF-8 JSON 对象、

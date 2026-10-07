@@ -126,6 +126,7 @@ rtl-lab verify design1.v [design2.v ...] \
     [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
     [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
     [--timeout SECONDS] [--workdir DIR] [--report report.json] \
+    [--junit report.xml] \
     [--incdir DIR ...] [--define NAME[=VALUE] ...] \
     [--parameter PATH=VALUE ...]
 ```
@@ -140,7 +141,7 @@ schema v3 报告；加 `--baseline PATH` 时与上次 verify 报告按 name 对�
 
 ```bash
 rtl-lab verify --manifest manifest.json \
-    [--report report.json] [--baseline PATH]
+    [--report report.json] [--baseline PATH] [--junit report.xml]
 ```
 
 `--manifest` 从 JSON 清单读取 verify 的全部配置，与逐项参数走完全相同
@@ -181,8 +182,8 @@ rtl-lab verify --manifest manifest.json \
   所在目录解析，与启动目录无关；数组顺序即配置顺序；
 - 顶层 `seeds` 非空时启用多种子矩阵（schema v5），仍禁止与测试台
   `seed` 同时生效；
-- `--manifest` 与配置性逐项参数互斥，仅 `--report`、`--baseline`
-  可并用（按启动目录解析）；冲突退出 2；
+- `--manifest` 与配置性逐项参数互斥，仅 `--report`、`--baseline`、
+  `--junit` 可并用（按启动目录解析）；冲突退出 2；
 - 清单不可读、非普通 UTF-8 JSON 对象、`schema_version` 非 1 或含未知
   键时退出 2，不生成或覆盖报告；其余字段校验与逐项参数一致。
 
@@ -195,7 +196,8 @@ Python 入口：`rtl_lab.load_verify_manifest(path)` 只构造等价的
 rtl-lab verify design1.v [design2.v ...] \
     --run-id ID --duration 100ns \
     --tb FILE[@TOP[@NAME]] ... --seeds 1,2,3 \
-    [--jobs N] [--baseline PATH] [--workdir DIR] [--report report.json]
+    [--jobs N] [--baseline PATH] [--workdir DIR] \
+    [--report report.json] [--junit report.xml]
 ```
 
 `--seeds` 与 regress 语义一致：逗号分隔的非负十进制整数（允许前导零、
@@ -235,6 +237,38 @@ report = verify(VerifyConfig(
     seeds=[1, 2, 3],   # 省略或为 None 时为传统单种子 schema v3
 ))
 ```
+
+### JUnit XML 输出
+
+`verify` 可在 JSON 报告之外额外输出一份 JUnit XML：命令行 `--junit PATH`
+与 Python 入口 `VerifyConfig.junit_path` 同义，逐项参数和 `--manifest`
+均可启用（清单 `schema_version` 仍为 1，不新增 junit 字段）。JSON 报告
+的 run、regress、报告版本、脱敏、摘要、退出码与裁决均不变；`junit_path`
+有值时在 verify 报告生成后输出 UTF-8 XML。
+
+- 根元素 `testsuites` 的 `name` 为 `run_id`；`tests`、`failures`、
+  `skipped` 全部从 testcase 汇总，`errors` 恒为 0；
+- 每个测试台按输入顺序生成一个同名 `testsuite`：单种子、编译失败或
+  跳过且无 `runs` 明细的测试台生成同名 testcase；多种子按执行顺序为
+  每个实际执行的种子生成 `测试台名[seed=种子值]` 的 testcase；
+- 通过项无子元素；可选跳过项为 `<skipped/>`，必测项被跳过记为
+  `RequiredTestSkipped` 失败；
+- 失败映射：`simulation_failed`→`SimulationFailure`、
+  `assertion_failed`→`AssertionFailure`、
+  `incomplete_statistics`→`IncompleteStatistics`、
+  `compilation_failed`→`CompilationFailure`；failure 内容取脱敏后的
+  reason 与 diagnostics，XML 特殊字符正确转义；
+- 覆盖率不达标时在追加的 `coverage` suite 中生成 `threshold`
+  testcase，以 `CoverageFailure` 记录命中数、总数、比率和阈值；
+  `comparison` 有差异时在追加的 `baseline` suite 中生成
+  `comparison` testcase，以 `BaselineMismatch` 记录差异条数；
+- 统计与 testcase 一致，suite 与 testcase 顺序稳定，不含时间戳或
+  耗时，相同报告生成相同 XML。
+
+`junit_path` 为空、与 `report_path` 或 `baseline_path` 指向同一文件时
+为输入错误（退出 2）；输出位置不可写或写入失败按 verify 前置条件失败
+处理（退出 8），JSON 与 XML 均不生成或覆盖。本不生成报告的输入错误、
+工具缺失同样不生成 XML。
 
 ## 报告版本
 
