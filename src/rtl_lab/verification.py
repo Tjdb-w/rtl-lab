@@ -47,6 +47,14 @@
 多种子报告保持 schema v5（同样追加 ``comparison``）。基线不存在、不可读、
 非合法 JSON、不是 rtl-lab 验证报告或版本不受支持时抛 :class:`InputError`，
 不执行仿真、不生成或覆盖报告。
+
+JUnit XML 输出（``VerifyConfig.junit_path``）：报告生成后，``junit_path``
+非空时在 JSON 报告之外额外写出一份 UTF-8 JUnit XML（结构见
+:mod:`rtl_lab.junit`），内容完全由报告决定、不含时间戳，相同报告生成相同
+XML。``junit_path`` 为空或与 ``report_path`` / ``baseline_path`` 指向同一
+文件时抛 :class:`InputError`；输出位置不可写或写入失败按前置条件失败处理
+（抛 :class:`OSError`，退出 8），JSON 与 XML 均不生成或覆盖。本就不生成
+报告的输入错误、工具缺失等路径同样不生成 XML。
 """
 
 import hashlib
@@ -59,6 +67,7 @@ from datetime import datetime, timezone
 from .baseline import compare_verification_reports, load_baseline_report
 from .duration import normalize_duration
 from .errors import InputError
+from .junit import write_junit
 from .parser import ResultCollector
 from .report import (
     Report,
@@ -189,6 +198,10 @@ class VerifyConfig:
     :param coverage: :class:`CoverageConfig`，缺省阈值 1.0。
     :param workdir: 工作目录（各测试台产物置于其下独立子目录）。
     :param report_path: JSON 报告输出路径，可为 None。
+    :param junit_path: JUnit XML 输出路径，可为 None；非空时在 JSON 报告
+        之外额外生成一份可复现的 JUnit XML（见 :mod:`rtl_lab.junit`）。
+        不能为空字符串，也不得与 ``report_path`` / ``baseline_path``
+        指向同一文件。
     :param jobs: 并发编译/仿真的测试台数，默认 1（顺序执行）；并发只发生
         在测试台之间，同一测试台的各种子始终串行。
     :param baseline_path: 上次 verify 生成的 JSON 报告路径，可为 None；
@@ -218,6 +231,7 @@ class VerifyConfig:
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
     workdir: str = "."
     report_path: str = None
+    junit_path: str = None
     jobs: int = 1
     baseline_path: str = None
     seeds: object = None
@@ -311,6 +325,22 @@ def _validate(config):
 
     if config.report_path:
         ensure_report_writable(config.report_path)
+
+    if config.junit_path is not None:
+        if not isinstance(config.junit_path, str) \
+                or not config.junit_path.strip():
+            raise InputError("JUnit XML 输出路径不能为空")
+        junit_abs = os.path.normpath(os.path.abspath(config.junit_path))
+        for label, other in (
+            ("报告", config.report_path),
+            ("基线", config.baseline_path),
+        ):
+            if other and os.path.normpath(os.path.abspath(other)) == junit_abs:
+                raise InputError(
+                    f"JUnit XML 输出路径不能与{label}路径相同："
+                    f"{config.junit_path}"
+                )
+        ensure_report_writable(config.junit_path)
 
     return amount, unit
 
@@ -604,7 +634,8 @@ def verify(config=None, **kwargs):
     :raises OSError: 报告输出位置不可写。
     :raises InputError: 源文件/测试台/时长/种子矩阵等输入非法，或
         ``--seeds`` 与 ``--tb-seed`` 并用，或基线报告不存在、不可读、
-        非合法 JSON、非 rtl-lab 验证报告、版本不受支持。
+        非合法 JSON、非 rtl-lab 验证报告、版本不受支持，或
+        ``junit_path`` 为空或与报告/基线路径指向同一文件。
     :raises RuntimeError: 结果归属错误、命名冲突、无可执行测试台或无任何
         覆盖率结果；这几种情况不覆盖已有报告。
     """
@@ -743,6 +774,10 @@ def verify(config=None, **kwargs):
             data["result"] = "failed"
 
     report = Report(data)
+    # JUnit XML 与 JSON 报告同源同内容；先写 XML，若其写入失败（退出 8）
+    # 则 JSON 也不生成或覆盖，两种输出保持一致。
+    if config.junit_path:
+        write_junit(report, config.junit_path)
     if config.report_path:
         write_report(report, config.report_path)
     return report

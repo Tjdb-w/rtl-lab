@@ -126,6 +126,7 @@ rtl-lab verify design1.v [design2.v ...] \
     [--coverage-threshold R] [--skip NAME ...] [--optional NAME ...] \
     [--tb-seed NAME=SEED ...] [--jobs N] [--baseline PATH] \
     [--timeout SECONDS] [--workdir DIR] [--report report.json] \
+    [--junit report.xml] \
     [--incdir DIR ...] [--define NAME[=VALUE] ...] \
     [--parameter PATH=VALUE ...]
 ```
@@ -136,11 +137,48 @@ schema v3 报告；加 `--baseline PATH` 时与上次 verify 报告按 name 对�
 （testbenches/assertions/coverage 的既有字段）并追加 `comparison`，
 为 schema v4，有差异则结论 failed。
 
+### JUnit XML 输出
+
+```bash
+rtl-lab verify ... [--report report.json] [--junit report.xml]
+```
+
+`--junit PATH`（Python 入口为 `VerifyConfig.junit_path`）在 JSON 报告
+之外额外生成一份 UTF-8 JUnit XML，供 CI 系统消费；逐项参数与
+`--manifest` 两种方式均可启用（清单 schema_version 仍为 1，`--junit`
+与 `--report`、`--baseline` 一样按启动目录解析）。run、regress 及
+JSON 报告的字段、脱敏、摘要、退出码与裁决均不受影响。
+
+XML 结构完全由 verify 报告决定：
+
+- 根元素 `testsuites` 以 `run_id` 为 `name`，`tests`/`failures`/
+  `skipped` 从全部 testcase 汇总，`errors` 恒为 0；
+- 每个测试台一个 `testsuite`（按输入顺序）；单种子、编译失败或跳过
+  （无 runs 明细）的测试台生成同名 testcase，多种子矩阵按执行顺序生成
+  `测试台名[seed=种子值]` 的 testcase；
+- 通过项无子元素；可选跳过用 `<skipped/>`，必测跳过用
+  `<skipped message="RequiredTestSkipped"/>`；失败按原因映射为
+  `<failure type="...">`：`simulation_failed`→`SimulationFailure`、
+  `assertion_failed`→`AssertionFailure`、
+  `incomplete_statistics`→`IncompleteStatistics`、
+  `compilation_failed`→`CompilationFailure`，内容为脱敏后的 reason
+  与 diagnostics，XML 特殊字符正确转义；
+- 覆盖率不达标时在 `coverage` suite 生成 `threshold` testcase
+  （`CoverageFailure`，记命中数、总数、比率与阈值）；基线对比有差异时
+  在 `baseline` suite 生成 `comparison` testcase（`BaselineMismatch`，
+  记差异条数）；
+- 输出不含时间戳与耗时，统计与 testcase 一致，相同报告生成相同 XML。
+
+`--junit` 为空或与 `--report`、`--baseline` 指向同一文件时为输入错误
+（退出 2）；输出位置不可写或写入失败按 verify 前置条件失败退出 8，
+JSON 与 XML 均不生成或覆盖；本就不生成报告的输入错误、工具缺失等
+路径同样不生成 XML。
+
 ### 清单驱动的统一验证
 
 ```bash
 rtl-lab verify --manifest manifest.json \
-    [--report report.json] [--baseline PATH]
+    [--report report.json] [--baseline PATH] [--junit report.xml]
 ```
 
 `--manifest` 从 JSON 清单读取 verify 的全部配置，与逐项参数走完全相同
@@ -181,8 +219,8 @@ rtl-lab verify --manifest manifest.json \
   所在目录解析，与启动目录无关；数组顺序即配置顺序；
 - 顶层 `seeds` 非空时启用多种子矩阵（schema v5），仍禁止与测试台
   `seed` 同时生效；
-- `--manifest` 与配置性逐项参数互斥，仅 `--report`、`--baseline`
-  可并用（按启动目录解析）；冲突退出 2；
+- `--manifest` 与配置性逐项参数互斥，仅 `--report`、`--baseline`、
+  `--junit` 可并用（按启动目录解析）；冲突退出 2；
 - 清单不可读、非普通 UTF-8 JSON 对象、`schema_version` 非 1 或含未知
   键时退出 2，不生成或覆盖报告；其余字段校验与逐项参数一致。
 
@@ -254,7 +292,8 @@ report = verify(VerifyConfig(
 - 5：仿真进程非零退出（生成 `simulation_failed` 报告，回归保留已有种子结果并停止后续种子）；
 - 6：断言失败（生成 `assertion_failed` 报告，回归继续执行剩余种子）；
 - 7：verify 总体结论 failed 或基线对比存在差异（编译、仿真或断言失败也生成 schema v5 报告）；
-- 8：verify 前置条件失败（命名冲突、无可执行测试台、无任何覆盖率结果等，不生成或覆盖报告）。
+- 8：verify 前置条件失败（命名冲突、无可执行测试台、无任何覆盖率结果、
+  报告或 JUnit 输出位置不可写等，不生成或覆盖报告，JSON 与 JUnit XML 均不落盘）。
 
 ## 约定
 

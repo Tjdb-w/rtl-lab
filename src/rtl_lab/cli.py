@@ -21,18 +21,26 @@
         [--jobs N] [--baseline PATH] [--timeout SECONDS] \
         [--incdir DIR ...] [--define NAME[=VALUE] ...] \
         [--parameter PATH=VALUE ...] \
-        [--workdir DIR] [--report report.json] \
+        [--workdir DIR] [--report report.json] [--junit report.xml] \
         design1.v [design2.v ...]
 
     rtl-lab verify --manifest manifest.json \
-        [--report report.json] [--baseline PATH]
+        [--report report.json] [--baseline PATH] [--junit report.xml]
 
 ``--manifest`` 从 JSON 清单（schema_version 1）读取 verify 的全部配置
 （run_id、duration、sources、testbenches、coverage 必填；compile、
 seeds、jobs、timeout、workdir 可选），清单内相对路径以清单目录解析；
-与配置性逐项参数互斥，仅 ``--report``、``--baseline`` 可并用（按启动
-目录解析）。清单非法（不可读、非 UTF-8 JSON 对象、schema_version 非 1、
-含未知键）时退出 2，不生成或覆盖报告。
+与配置性逐项参数互斥，仅 ``--report``、``--baseline``、``--junit``
+可并用（按启动目录解析）。清单非法（不可读、非 UTF-8 JSON 对象、
+schema_version 非 1、含未知键）时退出 2，不生成或覆盖报告。
+
+``--junit`` 在 JSON 报告之外额外输出一份 UTF-8 JUnit XML（结构见
+``rtl_lab.junit``）：每个测试台一个 testsuite，多种子按种子生成
+testcase，失败按原因映射为对应 failure 类型，覆盖率不达标与基线差异
+分别生成 coverage/baseline suite 的 failure testcase；内容完全由报告
+决定（不含时间戳），相同报告生成相同 XML。``--junit`` 为空或与
+``--report``、``--baseline`` 同文件时退出 2；输出不可写或写入失败
+按 verify 前置条件失败退出 8，JSON 与 XML 均不生成或覆盖。
 
 ``--incdir`` 与 ``--define`` 可重复给出，按顺序转换为 iverilog 的
 ``-I``/``-D`` 参数并随每次编译生效；省略时编译命令与既有行为一致。
@@ -51,8 +59,9 @@ seeds、jobs、timeout、workdir 可选），清单内相对路径以清单目�
 - 6：断言失败（生成 assertion_failed 报告）；
 - 7：统一验证总体结论 failed 或基线对比存在差异（仍生成完整
   verify 报告；单种子为 schema v3/v4，``--seeds`` 多种子为 schema v5）；
-- 8：verify 前置条件失败（run_id 为空、输出位置不可写、结果归属/命名
-  冲突、无可执行测试台或无任何覆盖率结果；不生成或覆盖报告）。
+- 8：verify 前置条件失败（run_id 为空、报告或 JUnit 输出位置不可写、
+  结果归属/命名冲突、无可执行测试台或无任何覆盖率结果；不生成或覆盖
+  报告，JSON 与 JUnit XML 均不落盘）。
 """
 
 import argparse
@@ -157,9 +166,9 @@ def _build_parser():
 def _add_verify_args(p):
     """添加 verify 子命令参数（sources 共用，测试台可多个）。
 
-    除 ``--report``/``--baseline``/``--manifest`` 外，各配置性参数默认
-    均为 None，以便在给出 ``--manifest`` 时检测互斥冲突；未给清单时由
-    :func:`_build_verify_config` 落回既有默认值。
+    除 ``--report``/``--baseline``/``--junit``/``--manifest`` 外，各配置性
+    参数默认均为 None，以便在给出 ``--manifest`` 时检测互斥冲突；未给清单
+    时由 :func:`_build_verify_config` 落回既有默认值。
     """
     p.add_argument(
         "sources", nargs="*", metavar="SOURCE",
@@ -169,7 +178,8 @@ def _add_verify_args(p):
         "--manifest", dest="manifest", default=None, metavar="PATH",
         help="验证清单（JSON，schema_version 1）；提供 run_id、duration、"
              "sources、testbenches、coverage 等全部配置，相对路径以清单"
-             "目录解析；与逐项配置参数互斥，仅 --report、--baseline 可并用",
+             "目录解析；与逐项配置参数互斥，仅 --report、--baseline、"
+             "--junit 可并用",
     )
     p.add_argument(
         "--run-id", dest="run_id", default=None, metavar="ID",
@@ -235,6 +245,12 @@ def _add_verify_args(p):
         help="JSON 报告输出路径",
     )
     p.add_argument(
+        "--junit", dest="junit", default=None, metavar="PATH",
+        help="JUnit XML 输出路径；在 JSON 报告之外额外生成，内容完全由 "
+             "verify 报告决定（不含时间戳），相同报告生成相同 XML；"
+             "不可与 --report、--baseline 指向同一文件",
+    )
+    p.add_argument(
         "--incdir", dest="include_dirs", action="append", default=None,
         metavar="DIR",
         help="include 文件搜索目录，可重复；按给出顺序以 -I 传给 "
@@ -296,7 +312,7 @@ def _check_verify_required(args, subparser):
 
 
 def _build_manifest_verify_config(args):
-    """从 --manifest 清单构造 :class:`VerifyConfig`（仅 --report/--baseline 可并用）。"""
+    """从 --manifest 清单构造 :class:`VerifyConfig`（仅 --report/--baseline/--junit 可并用）。"""
     conflicts = []
     if args.sources:
         conflicts.append("SOURCE")
@@ -330,9 +346,10 @@ def _build_manifest_verify_config(args):
             "--manifest 不可与配置性逐项参数并用：" + "、".join(conflicts)
         )
     config = load_verify_manifest(args.manifest)
-    # 报告与基线不属于清单内容，按启动目录解析后并入配置。
+    # 报告、基线与 JUnit 输出不属于清单内容，按启动目录解析后并入配置。
     config.report_path = args.report
     config.baseline_path = args.baseline
+    config.junit_path = args.junit
     return config
 
 
@@ -390,6 +407,7 @@ def _build_verify_config(args):
         coverage=coverage,
         workdir=args.workdir if args.workdir is not None else ".",
         report_path=args.report,
+        junit_path=args.junit,
         jobs=args.jobs if args.jobs is not None else 1,
         baseline_path=args.baseline,
         seeds=matrix_seeds,
